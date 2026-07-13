@@ -1,0 +1,11 @@
+chroma_db/
+chroma_db_test/
+chroma_db_test2/
+rag_cache/
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+*.backup.*
+**/*.backup.*

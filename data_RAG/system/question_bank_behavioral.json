@@ -1,0 +1,26 @@
+{
+  "title": "Behavioral Question Bank — Engineering",
+  "level": "SWE3-SWE4",
+  "questions": [
+    {
+      "type": "behavioral",
+      "prompt": "Describe a time you owned a production incident end-to-end. What was your role and what changed afterward?",
+      "competency": "ownership"
+    },
+    {
+      "type": "behavioral",
+      "prompt": "Tell me about a technical decision where you disagreed with your team. How did you resolve it?",
+      "competency": "collaboration"
+    },
+    {
+      "type": "technical",
+      "prompt": "Walk through how you would design a rate-limited public API for mobile clients.",
+      "competency": "system_design"
+    },
+    {
+      "type": "situational",
+      "prompt": "A critical release is tomorrow and QA found a P1 bug. What do you do?",
+      "competency": "prioritization"
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Loại bỏ Co-authored-by: Cursor — tránh cursoragent xuất hiện trong GitHub Contributors
+COMMIT_MSG_FILE=$1
+if [ -f "$COMMIT_MSG_FILE" ]; then
+  grep -v 'Co-authored-by: Cursor' "$COMMIT_MSG_FILE" > "$COMMIT_MSG_FILE.tmp" && mv "$COMMIT_MSG_FILE.tmp" "$COMMIT_MSG_FILE"
+fi
