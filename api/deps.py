@@ -16,6 +16,7 @@ from services.document_parser import DocumentParser
 from services.embedding_service import EmbeddingService
 from services.plan_generation_service import PlanGenerationService
 from services.question_assist_service import QuestionAssistService
+from services.evaluate_answer_service import EvaluateAnswerService
 from services.question_generation_service import QuestionGenerationService
 from services.rag_ingest_service import RagIngestService
 from services.jd_parse_service import JdParseService
@@ -32,6 +33,7 @@ _jd_parse_service: JdParseService | None = None
 _async_generation_service: AsyncGenerationService | None = None
 _async_ingest_service: AsyncIngestService | None = None
 _question_assist_service: QuestionAssistService | None = None
+_evaluate_answer_service: EvaluateAnswerService | None = None
 
 
 @dataclass
@@ -45,7 +47,7 @@ class AppServices:
 
 
 def startup() -> None:
-    global _pool, _vector_store, _openai_client, _ingest_service, _question_service, _plan_service, _jd_parse_service, _async_generation_service, _async_ingest_service, _question_assist_service
+    global _pool, _vector_store, _openai_client, _ingest_service, _question_service, _plan_service, _jd_parse_service, _async_generation_service, _async_ingest_service, _question_assist_service, _evaluate_answer_service
 
     settings = get_settings()
     _pool = ConnectionPool(conninfo=settings.database_url, min_size=1, max_size=10, open=True)
@@ -85,10 +87,11 @@ def startup() -> None:
     )
     _async_ingest_service = AsyncIngestService(ingest_service=_ingest_service)
     _question_assist_service = QuestionAssistService(client=_openai_client, settings=settings)
+    _evaluate_answer_service = EvaluateAnswerService(client=_openai_client, settings=settings)
 
 
 def shutdown() -> None:
-    global _pool, _vector_store, _openai_client, _ingest_service, _question_service, _plan_service, _jd_parse_service, _async_generation_service, _async_ingest_service, _question_assist_service
+    global _pool, _vector_store, _openai_client, _ingest_service, _question_service, _plan_service, _jd_parse_service, _async_generation_service, _async_ingest_service, _question_assist_service, _evaluate_answer_service
 
     if _pool is not None:
         _pool.close()
@@ -102,6 +105,7 @@ def shutdown() -> None:
     _async_generation_service = None
     _async_ingest_service = None
     _question_assist_service = None
+    _evaluate_answer_service = None
 
 
 def get_services() -> AppServices:
@@ -169,3 +173,9 @@ def get_question_assist_service() -> QuestionAssistService:
     if _question_assist_service is None:
         raise RuntimeError("Question assist service chưa được khởi tạo")
     return _question_assist_service
+
+
+def get_evaluate_answer_service() -> EvaluateAnswerService:
+    if _evaluate_answer_service is None:
+        raise RuntimeError("Evaluate answer service chưa được khởi tạo")
+    return _evaluate_answer_service

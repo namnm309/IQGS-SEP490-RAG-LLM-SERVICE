@@ -4,6 +4,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Up
 from api.deps import (
     get_async_generation_service,
     get_async_ingest_service,
+    get_evaluate_answer_service,
     get_ingest_service,
     get_jd_parse_service,
     get_plan_service,
@@ -13,6 +14,8 @@ from api.deps import (
 from models.internal_schemas import (
     AsyncAcceptedResponse,
     DeleteDocumentResponse,
+    EvaluateAnswerRequest,
+    EvaluateAnswerResponse,
     GeneratePlanAsyncRequest,
     GeneratePlanRequest,
     GeneratePlanResponse,
@@ -32,6 +35,7 @@ from models.internal_schemas import (
 from security.internal_api_key import verify_internal_api_key
 from services.async_generation_service import AsyncGenerationService
 from services.async_ingest_service import AsyncIngestService
+from services.evaluate_answer_service import EvaluateAnswerService
 from services.jd_parse_service import JdParseService
 from services.plan_generation_service import PlanGenerationService
 from services.question_assist_service import QuestionAssistService
@@ -189,6 +193,19 @@ def question_assist(
     service: QuestionAssistService = Depends(get_question_assist_service),
 ) -> QuestionAssistResponse:
     return service.assist(request)
+
+
+@router.post(
+    "/evaluate-answer",
+    response_model=EvaluateAnswerResponse,
+    response_model_exclude_none=True,
+)
+def evaluate_answer(
+    request: EvaluateAnswerRequest,
+    service: EvaluateAnswerService = Depends(get_evaluate_answer_service),
+) -> EvaluateAnswerResponse:
+    """Chấm điểm câu trả lời Candidate theo rubric (SCRUM-281)."""
+    return service.evaluate(request)
 
 
 @router.delete("/documents/{document_id}", response_model=DeleteDocumentResponse)

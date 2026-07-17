@@ -394,3 +394,36 @@ class QuestionAssistResponse(BaseModel):
     detail: str | None = None
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+# ── Evaluate Answer (SCRUM-281) — chấm câu trả lời Candidate ─────────────────
+
+
+class EvaluateAnswerRequest(BaseModel):
+    """Input BE gửi khi Candidate submit answer trong practice session."""
+
+    question: str
+    evaluation_criteria: list[str] = Field(default_factory=list, alias="evaluationCriteria")
+    candidate_answer: str = Field(..., alias="candidateAnswer")
+    sample_answer: str | None = Field(default=None, alias="sampleAnswer")
+    jd_context: str | None = Field(default=None, alias="jdContext")
+    skill: str | None = None
+    question_type: str | None = Field(default=None, alias="questionType")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class EvaluateAnswerResponse(BaseModel):
+    """Kết quả chấm điểm — không bao giờ trả sampleAnswer ra ngoài."""
+
+    success: bool = True
+    score: float | None = None
+    strengths: list[str] = Field(default_factory=list)
+    improvements: list[str] = Field(default_factory=list)
+    suggestion: str | None = None
+    dimension_scores: dict[str, float] | None = Field(default=None, alias="dimensionScores")
+    processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
+    error: str | None = None
+    detail: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
