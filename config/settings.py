@@ -17,6 +17,12 @@ class Settings(BaseSettings):
     internal_api_key: str = Field(..., alias="INTERNAL_API_KEY")
 
     ollama_base_url: str = Field("http://localhost:11434/v1", alias="OLLAMA_BASE_URL")
+    # Placeholder cho OpenAI SDK; Ollama local thường không cần key thật. Runtime DB có thể override.
+    ollama_api_key: str = Field("ollama", alias="OLLAMA_API_KEY")
+    # SCRUM-379: chat LLM tách khỏi embedding (có thể OpenRouter)
+    llm_provider: str = Field("ollama", alias="LLM_PROVIDER")
+    chat_base_url: str = Field("http://localhost:11434/v1", alias="CHAT_BASE_URL")
+    chat_api_key: str = Field("ollama", alias="CHAT_API_KEY")
     chat_model: str = Field("gemma4b:cloud", alias="CHAT_MODEL")
     embedding_model: str = Field("nomic-embed-text", alias="EMBEDDING_MODEL")
     embedding_dimension: int = Field(768, alias="EMBEDDING_DIMENSION")
@@ -26,6 +32,8 @@ class Settings(BaseSettings):
     chunk_overlap: int = Field(200, alias="CHUNK_OVERLAP")
     top_k_system: int = Field(5, alias="TOP_K_SYSTEM")
     top_k_hr: int = Field(5, alias="TOP_K_HR")
+    # Temperature chung cho generation paths (Admin override qua rag_runtime_settings) — SCRUM-378
+    temperature: float = Field(0.3, alias="TEMPERATURE")
     request_timeout_seconds: int = Field(120, alias="REQUEST_TIMEOUT_SECONDS")
     debug: bool = Field(False, alias="DEBUG")
 
