@@ -40,6 +40,15 @@ def test_extract_json_object_invalid() -> None:
     assert "JSON" in err
 
 
+def test_extract_json_invalid_escape_repaired() -> None:
+    # LLM chèn \s (invalid) trong string
+    raw = r'{"questions":[{"question":"path C:\sers\x","question_type":"technical","difficulty":"medium","rationale":"a","sample_answer":"b","citations":[]}]}'
+    data, err = extract_json_object(raw)
+    assert err is None
+    assert data is not None
+    assert "questions" in data
+
+
 def test_build_json_fix_prompt_truncates() -> None:
     prompt = build_json_fix_prompt("x" * 5000, max_len=100)
     assert len(prompt) < 500
