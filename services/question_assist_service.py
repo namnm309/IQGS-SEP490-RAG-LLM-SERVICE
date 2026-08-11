@@ -120,7 +120,7 @@ class QuestionAssistService:
         response = self._client.chat.completions.create(
             model=self._settings.chat_model,
             messages=messages,
-            temperature=0.4,
+            temperature=self._settings.temperature,
         )
         return (response.choices[0].message.content or "").strip()
 

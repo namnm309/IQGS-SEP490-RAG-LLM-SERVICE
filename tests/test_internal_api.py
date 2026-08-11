@@ -79,10 +79,31 @@ def client(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> TestClient:
     monkeypatch.setattr(deps, "shutdown", lambda: None)
 
     deps._pool = MagicMock()
+    deps._settings_ref = settings
     deps._vector_store = mock_store
     deps._ingest_service = mock_ingest
     deps._question_service = mock_question
     deps._plan_service = mock_plan
+    deps._openai_client = MagicMock()
+
+    monkeypatch.setattr(deps, "refresh_runtime_config", lambda force=False: {
+        "applied": False,
+        "connectionChanged": False,
+        "chatModel": settings.chat_model,
+        "ollamaBaseUrl": settings.ollama_base_url,
+        "temperature": settings.temperature,
+        "topKSystem": settings.top_k_system,
+        "topKHr": settings.top_k_hr,
+    })
+    monkeypatch.setattr(deps, "reload_runtime_config", lambda: {
+        "applied": True,
+        "connectionChanged": False,
+        "chatModel": settings.chat_model,
+        "ollamaBaseUrl": settings.ollama_base_url,
+        "temperature": settings.temperature,
+        "topKSystem": settings.top_k_system,
+        "topKHr": settings.top_k_hr,
+    })
 
     mock_async = MagicMock()
     deps._async_generation_service = mock_async
@@ -316,3 +337,47 @@ def test_generate_questions_from_plan_async_returns_202(
     body = response.json()
     assert body["accepted"] is True
     assert body["phase"] == "QUESTIONS"
+
+
+def test_models_requires_api_key(client: TestClient) -> None:
+    response = client.get("/internal/rag/models")
+    assert response.status_code == 401
+
+
+def test_models_with_api_key(client: TestClient, settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "models": [
+                    {"name": "nomic-embed-text", "size": 1, "digest": "abc"},
+                    {"name": "gemma4b:cloud", "size": 2, "digest": "def"},
+                ]
+            }
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: FakeResponse())
+
+    response = client.get(
+        "/internal/rag/models",
+        headers={"X-Internal-Api-Key": settings.internal_api_key},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["models"]) == 2
+    assert body["models"][1]["isCloud"] is True
+
+
+def test_reload_config_with_api_key(client: TestClient, settings: Settings) -> None:
+    response = client.post(
+        "/internal/rag/reload-config",
+        headers={"X-Internal-Api-Key": settings.internal_api_key},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["success"] is True
+    assert body["chatModel"] == settings.chat_model
+
