@@ -24,6 +24,7 @@ Internal microservice cho **IQGS** (Intelligent Question Generation System) — 
    - [7.5 Sinh câu hỏi từ approved plan](#75-sinh-câu-hỏi-từ-approved-plan)
    - [7.6 Shortcut sinh câu hỏi (dev)](#76-shortcut-sinh-câu-hỏi-dev)
    - [7.7 Validate & Parse JD](#77-validate--parse-jd)
+   - [7.7a Parse CV (SCRUM-300)](#77a-parse-cv-scrum-300)
    - [7.8 Question Assist (Ask AI)](#78-question-assist-ask-ai)
    - [7.9 Xóa document chunks](#79-xóa-document-chunks)
    - [7.10 Luồng end-to-end HR](#710-luồng-end-to-end-hr)
@@ -200,6 +201,7 @@ RAG/
 │   ├── question_generation_service.py  # Retrieve → LLM → questions JSON
 │   ├── question_assist_service.py  # Ask AI per question (no retrieval)
 │   ├── jd_parse_service.py         # Validate/parse JD file & text
+│   ├── cv_parse_service.py         # Parse CV + AI trích skills (SCRUM-300)
 │   ├── async_generation_service.py # Background plan/questions + callback
 │   ├── backend_callback_client.py  # PATCH status/generation-result về BE
 │   ├── embedding_service.py        # Ollama batch embedding
@@ -306,6 +308,7 @@ X-Internal-Api-Key: <INTERNAL_API_KEY>
 | `POST` | `/internal/rag/ingest/async` | Async | **202** | Production ingest — trả ngay, xử lý background |
 | `POST` | `/internal/rag/validate-jd` | Sync | 200 / **422** | Validate JD text (độ dài, số từ) |
 | `POST` | `/internal/rag/parse-jd` | Sync | 200 / **422** | Multipart upload file → trích JD text |
+| `POST` | `/internal/rag/parse-cv` | Sync | 200 / **422** / **502** | Multipart CV (PDF/DOCX/JPG/PNG) → AI trích `skills[]` + `summary` |
 | `POST` | `/internal/rag/generate-plan` | Sync | 200 | Retrieve + LLM → interview plan JSON |
 | `POST` | `/internal/rag/generate-plan/async` | Async | **202** | Production plan generation |
 | `POST` | `/internal/rag/generate-questions-from-plan` | Sync | 200 | Retrieve + LLM → questions theo approved plan |
@@ -322,6 +325,8 @@ X-Internal-Api-Key: <INTERNAL_API_KEY>
 | `/ingest/async` | `AsyncAcceptedResponse` | `accepted`, `documentId`, `phase: "INGEST"` |
 | `/generate-plan/async` | `AsyncAcceptedResponse` | `accepted`, `jobId`, `phase: "PLAN"` |
 | `/generate-questions-from-plan/async` | `AsyncAcceptedResponse` | `accepted`, `jobId`, `phase: "QUESTIONS"` |
+| `/parse-jd` | `ParseJdResponse` | `success`, `jobDescription`, `fileName`, `stats` |
+| `/parse-cv` | `ParseCvResponse` | `success`, `skills`, `summary`, `fileName` |
 | `/generate-plan` | `GeneratePlanResponse` | `success`, `plan`, `processingTimeMs`, `error` |
 | `/generate-questions-from-plan` | `GenerateQuestionsFromPlanResponse` | `success`, `questions`, `processingTimeMs`, `error` |
 | `/question-assist` | `QuestionAssistResponse` | `success`, `assistantMessage`, `suggestion` |
@@ -538,6 +543,33 @@ Backend gọi `parse-jd` khi HR upload file JD (`QuestionGenerationJobService.Pa
 
 ---
 
+### 7.7a Parse CV (SCRUM-300)
+
+Candidate upload CV qua Backend → RAG trích kỹ năng bằng **một model** `CHAT_MODEL` (Hướng A).
+
+```mermaid
+flowchart LR
+    subgraph ParseCv [parse-cv]
+        PC[POST /parse-cv multipart] --> Check{Loại file?}
+        Check -->|PDF DOCX| Parser[document_parser]
+        Parser --> TextLLM[OpenAI /v1 chat]
+        Check -->|JPG JPEG PNG| VisionLLM[Ollama /api/chat images]
+        TextLLM --> JSON[skills summary JSON]
+        VisionLLM --> JSON
+    end
+```
+
+| Loại file | Cách xử lý |
+|-----------|------------|
+| `.pdf`, `.docx` | `DocumentParser` trích text → `chat.completions` qua `/v1` |
+| `.jpg`, `.jpeg`, `.png` | Base64 → Ollama native `POST /api/chat` với field `images` |
+
+**Lưu ý:** Ảnh **không** gửi qua OpenAI-style `image_url` trên `/v1` — dùng native API để model Gemma đọc được ảnh.
+
+Backend gọi `parse-cv` khi Candidate upload CV (`RagService.ParseCvAsync` → `CandidateCvService`).
+
+---
+
 ### 7.8 Question Assist (Ask AI)
 
 **Không dùng vector search** — chỉ LLM với context đã có trong request.
@@ -643,6 +675,7 @@ sequenceDiagram
 | `GeneratePlanJob` | `InfrastructureLayer/Jobs/GeneratePlanJob.cs` | `POST /generate-plan/async` |
 | `GenerateQuestionsFromPlanJob` | `InfrastructureLayer/Jobs/GenerateQuestionsFromPlanJob.cs` | `POST /generate-questions-from-plan/async` |
 | `QuestionGenerationJobService` | `ApplicationLayer/Services/...` | `POST /parse-jd` |
+| `CandidateCvService` | `ApplicationLayer/Services/CandidateCvService.cs` | `POST /parse-cv` |
 | `QuestionAiAssistService` | `ApplicationLayer/Services/...` | `POST /question-assist` |
 | `KnowledgeDocumentService` | delete flow | `DELETE /documents/{id}` |
 | `RagService` (HttpClient) | `InfrastructureLayer/External/RagService.cs` | Tất cả endpoints trên |
@@ -882,6 +915,31 @@ Response `200`:
   "stats": { "charCount": 2100, "wordCount": 350 }
 }
 ```
+
+### 11.4a Parse CV (multipart) — SCRUM-300
+
+```http
+POST /internal/rag/parse-cv
+X-Internal-Api-Key: internal-secret
+Content-Type: multipart/form-data
+
+file: <cv_backend_dev.pdf>
+```
+
+Định dạng hỗ trợ: `.pdf`, `.docx`, `.jpg`, `.jpeg`, `.png`.
+
+Response `200`:
+
+```json
+{
+  "success": true,
+  "skills": ["C#", "ASP.NET Core", "PostgreSQL", "Docker"],
+  "summary": "Backend Developer với 3 năm kinh nghiệm xây dựng REST API.",
+  "fileName": "cv_backend_dev.pdf"
+}
+```
+
+Lỗi định dạng/đọc file: `422` (`stage: CV_PARSE`). Lỗi AI/LLM: `502` (`stage: CV_AI_ANALYSIS`).
 
 ### 11.5 Generate plan (sync)
 
