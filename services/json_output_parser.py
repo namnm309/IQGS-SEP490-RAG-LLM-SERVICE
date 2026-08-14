@@ -8,8 +8,18 @@ from typing import Any
 JSON_FIX_USER_PROMPT = (
     "Lần trước bạn trả về JSON không hợp lệ. "
     "Chỉ sửa và trả về JSON hợp lệ theo schema, không markdown, không giải thích ngoài JSON.\n"
+    "Lưu ý escape: trong string JSON chỉ dùng \\\\ \\\\\\\" \\\\n \\\\t \\\\uXXXX — "
+    "không dùng \\s, \\a hay backslash đơn trước ký tự thường.\n"
     "Output lỗi trước:\n{invalid_output}"
 )
+
+# Escape JSON hợp lệ: \" \\ \/ \b \f \n \r \t \uXXXX
+_INVALID_JSON_ESCAPE = re.compile(
+    r'\\(?!(["\\/bfnrt]|u[0-9a-fA-F]{4}))'
+)
+
+# Trailing comma trước } hoặc ]
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
 
 
 def strip_markdown_fences(text: str) -> str:
@@ -21,6 +31,32 @@ def strip_markdown_fences(text: str) -> str:
     return re.sub(r"\s*```$", "", stripped).strip()
 
 
+def fix_invalid_json_escapes(text: str) -> str:
+    """
+    LLM hay chèn \\s, \\C# (đường dẫn), \\% … trong string → Invalid \\escape.
+    Chuyển backslash không hợp lệ thành \\\\ (backslash literal trong JSON).
+    """
+    return _INVALID_JSON_ESCAPE.sub(lambda m: "\\\\" + m.group(0)[1:], text)
+
+
+def fix_trailing_commas(text: str) -> str:
+    """Bỏ trailing comma trong object/array (model hay để lại)."""
+    prev = None
+    out = text
+    # Lặp vì có nhiều chỗ
+    while prev != out:
+        prev = out
+        out = _TRAILING_COMMA.sub(r"\1", out)
+    return out
+
+
+def _try_load(text: str) -> tuple[Any | None, str | None]:
+    try:
+        return json.loads(text), None
+    except json.JSONDecodeError as exc:
+        return None, str(exc)
+
+
 def extract_json_object(text: str) -> tuple[Any | None, str | None]:
     """
     Parse JSON từ raw LLM output.
@@ -28,19 +64,31 @@ def extract_json_object(text: str) -> tuple[Any | None, str | None]:
     """
     cleaned = strip_markdown_fences(text)
 
-    try:
-        return json.loads(cleaned), None
-    except json.JSONDecodeError:
-        pass
+    candidates = [cleaned]
+    repaired = fix_trailing_commas(fix_invalid_json_escapes(cleaned))
+    if repaired != cleaned:
+        candidates.append(repaired)
 
-    match = re.search(r"\{[\s\S]*\}", cleaned)
-    if not match:
-        return None, "LLM không trả về JSON hợp lệ."
+    last_err: str | None = None
+    for candidate in candidates:
+        data, err = _try_load(candidate)
+        if err is None:
+            return data, None
+        last_err = err
 
-    try:
-        return json.loads(match.group()), None
-    except json.JSONDecodeError as exc:
-        return None, f"Không parse được JSON: {exc}"
+        match = re.search(r"\{[\s\S]*\}", candidate)
+        if not match:
+            continue
+        blob = match.group()
+        for attempt in (blob, fix_trailing_commas(fix_invalid_json_escapes(blob))):
+            data, err = _try_load(attempt)
+            if err is None:
+                return data, None
+            last_err = err
+
+    if last_err:
+        return None, f"Không parse được JSON: {last_err}"
+    return None, "LLM không trả về JSON hợp lệ."
 
 
 def build_json_fix_prompt(invalid_output: str, *, max_len: int = 2000) -> str:
@@ -54,6 +102,8 @@ def is_retryable_json_error(error: str) -> bool:
         "LLM không trả về JSON hợp lệ",
         "Không parse được JSON",
         "JSON thiếu object",
+        "Invalid \\escape",
+        "Invalid escape",
     )
     return any(phrase in error for phrase in json_error_phrases)
 
