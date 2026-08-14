@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -27,36 +28,65 @@ from services.json_output_parser import (
     is_retryable_plan_error,
 )
 from services.rag_context_helpers import (
+    JD_SOURCE_FILE,
     build_chunk_lookup,
     enrich_citations,
+    ensure_jd_primary_citations,
+    ensure_jd_primary_source_files,
     format_retrieved_context,
     parse_citations,
 )
 from services.rag_retrieval_service import RagRetrievalService
 from vectorstores.base import RetrievedChunk
+from helpers.language_prompt import free_text_language_label, language_instruction_block
 
 logger = logging.getLogger(__name__)
+_DEFAULT_CODE_TEMPLATES = [
+    "CODE_COMPLETION",
+    "BUG_DETECTION",
+    "REFACTORING",
+    "TEST_CASE_DESIGN",
+    "PERFORMANCE_ANALYSIS",
+    "SYSTEM_DESIGN",
+]
 
-PLAN_SYSTEM_PROMPT = """Bạn là chuyên gia lập kế hoạch phỏng vấn (interview planning expert).
+
+def _parse_content_preferences(hr_note: str | None) -> tuple[str, list[str]]:
+    note = (hr_note or "").strip()
+    if not note:
+        return "Mixed", _DEFAULT_CODE_TEMPLATES
+    mode_match = re.search(r"CONTENT_MODE=([A-Za-z]+)", note)
+    mode = (mode_match.group(1) if mode_match else "Mixed").strip()
+    if mode not in {"TheoryOnly", "CodeOnly", "Mixed"}:
+        mode = "Mixed"
+    tpl_match = re.search(r"CODE_TEMPLATES=([^;\n]+)", note)
+    if not tpl_match:
+        return mode, _DEFAULT_CODE_TEMPLATES
+    templates = [x.strip() for x in tpl_match.group(1).split(",") if x.strip()]
+    return mode, templates or _DEFAULT_CODE_TEMPLATES
+
+_PLAN_SYSTEM_PROMPT_BASE = """Bạn là chuyên gia lập kế hoạch phỏng vấn (interview planning expert).
 
 ## Mục tiêu
 Tạo KẾ HOẠCH câu hỏi phỏng vấn (interview question plan), KHÔNG tạo câu hỏi cụ thể.
-Dùng job description (JD), skills, hrNote và context đã retrieve từ [HỆ THỐNG] / [HR] nếu có.
+JD là nguồn CHÍNH; Knowledge ([HỆ THỐNG]/[HR] chunks) chỉ là nguồn PHỤ (policy, chuẩn nội bộ, tech doc).
 
 ## Nguồn suy luận (BẮT BUỘC)
 Mọi field trong plan PHẢI do bạn suy luận từ:
-1) jobDescription + hrNote + skills/loai_cau HR gửi
-2) Context đã retrieve [HỆ THỐNG] / [HR] (nếu có)
+1) jobDescription + hrNote + skills/loai_cau HR gửi (CHÍNH)
+2) Context đã retrieve [HỆ THỐNG] / [HR] (PHỤ — nếu có)
 KHÔNG được bỏ trống field, KHÔNG dùng giá trị mặc định ẩn, KHÔNG copy máy móc input HR nếu JD/RAG cho tín hiệu khác.
+Không để Knowledge thay thế yêu cầu trong JD nếu mâu thuẫn.
 
 ## Quy tắc
 1. Chỉ trả về JSON hợp lệ, không markdown, không giải thích ngoài JSON.
 2. Không bịa skills không liên quan đến JD hoặc skills được yêu cầu.
 3. Mỗi coverage item phải gắn với skills yêu cầu hoặc trách nhiệm trong JD.
-4. Citations tham chiếu chunks đã retrieve khi có liên quan; excerpt trích nguyên văn ngắn. Nếu không có chunk context, trả citations là [].
-5. total_questions phải khớp số câu yêu cầu (so_cau); phân bổ question_type_distribution và difficulty_distribution phải cộng đúng total_questions.
-6. Trả lời bằng tiếng Việt cho summary, reason, goal, notes.
-7. [HỆ THỐNG] và [HR] là context bổ sung và có thể trống; nếu thiếu context thì vẫn tạo plan dựa trên jobDescription, skills và hrNote.
+4. Citations: BẮT BUỘC có citation JD đầu tiên (knowledge_base=\"hr\", source_file=\"{jd_source}\", chunk_index=0). SCRUM-394: excerpt JD phải trích NGUYÊN VĂN từ jobDescription (substring liên quan skills/role) — giống excerpt Knowledge từ chunk; không paraphrase, không rỗng. Citation Knowledge chỉ thêm sau khi dùng chunk.
+5. Mỗi coverage.source_files phải bắt đầu bằng \"{jd_source}\"; thêm file KB phía sau nếu dùng.
+6. total_questions phải khớp số câu yêu cầu (so_cau); phân bổ question_type_distribution và difficulty_distribution phải cộng đúng total_questions.
+7. {language_rule}
+8. [HỆ THỐNG] và [HR] là context bổ sung và có thể trống; nếu thiếu context thì vẫn tạo plan dựa trên jobDescription, skills và hrNote.
 
 ## Field bắt buộc để map API (phải khớp yêu cầu HR)
 - role_title: tên VỊ TRÍ tuyển dụng suy ra từ JD (ví dụ "Backend Developer") — KHÔNG phải danh sách skills.
@@ -75,11 +105,11 @@ KHÔNG được bỏ trống field, KHÔNG dùng giá trị mặc định ẩn, 
 - skills: ưu tiên skills HR gửi, bổ sung từ JD nếu thiếu và liên quan.
 - question_type_distribution: phân bổ theo loại câu HR yêu cầu (loai_cau); chỉ dùng các type đã cho.
 
-8. experience_level và level là field BẮT BUỘC — thiếu một trong hai thì JSON không hợp lệ.
+9. experience_level và level là field BẮT BUỘC — thiếu một trong hai thì JSON không hợp lệ.
 
 ## Schema JSON bắt buộc
-{
-  "plan": {
+{{
+  "plan": {{
     "role_title": "string",
     "summary": "string",
     "difficulty": "easy|medium|hard",
@@ -88,35 +118,45 @@ KHÔNG được bỏ trống field, KHÔNG dùng giá trị mặc định ẩn, 
     "total_questions": 10,
     "skills": ["skill1"],
     "question_type_distribution": [
-      {"type": "technical", "count": 6, "reason": "string"}
+      {{"type": "technical", "count": 6, "reason": "string"}}
     ],
     "difficulty_distribution": [
-      {"difficulty": "medium", "count": 10}
+      {{"difficulty": "medium", "count": 10}}
     ],
     "coverage": [
-      {"skill": "ASP.NET Core", "question_count": 3, "focus_areas": ["Web API"]}
+      {{"skill": "ASP.NET Core", "question_count": 3, "focus_areas": ["Web API"], "source_files": ["{jd_source}", "ten_file.pdf"]}}
     ],
     "recommended_question_outline": [
-      {
+      {{
         "order": 1,
         "type": "technical",
         "difficulty": "medium",
         "skill": "ASP.NET Core",
         "focus_area": "Middleware",
         "goal": "string"
-      }
+      }}
     ],
     "notes": "string",
     "citations": [
-      {
-        "knowledge_base": "system|hr",
-        "source_file": "ten_file",
+      {{
+        "knowledge_base": "hr",
+        "source_file": "{jd_source}",
         "chunk_index": 0,
-        "excerpt": "đoạn trích ngắn"
-      }
+        "excerpt": "doan trich ngan tu JD"
+      }}
     ]
-  }
-}"""
+  }}
+}}""".replace("{jd_source}", JD_SOURCE_FILE)
+
+
+def _plan_system_prompt(language: str | None) -> str:
+    return _PLAN_SYSTEM_PROMPT_BASE.format(
+        language_rule=language_instruction_block(language)
+    )
+
+
+# Tương thích import cũ
+PLAN_SYSTEM_PROMPT = _plan_system_prompt("Vietnamese")
 
 
 class PlanGenerationService:
@@ -128,7 +168,7 @@ class PlanGenerationService:
     ):
         self._retrieval = retrieval
         self._client = client
-        self._chat_model = settings.chat_model
+        self._settings = settings
 
     def _fail(
         self,
@@ -158,9 +198,13 @@ class PlanGenerationService:
             return self._fail(start, "jobDescription là bắt buộc", "VALIDATION")
 
         try:
+            # SCRUM-388: filter Selected docs + query JD+hrNote (instruction/focus)
+            doc_ids = [str(d).strip() for d in (request.document_ids or []) if str(d).strip()]
             system_chunks, hr_chunks = self._retrieval.retrieve_for_job(
                 request.job_description,
                 request.owner_id.strip(),
+                document_ids=doc_ids or None,
+                query_extra=request.hr_note,
             )
         except Exception as exc:
             logger.exception("Retrieval failed")
@@ -176,7 +220,7 @@ class PlanGenerationService:
 
         user_message = self._build_user_message(request, system_chunks, hr_chunks)
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": PLAN_SYSTEM_PROMPT},
+            {"role": "system", "content": _plan_system_prompt(request.language)},
             {"role": "user", "content": user_message},
         ]
 
@@ -223,8 +267,9 @@ class PlanGenerationService:
 
     def _call_llm(self, messages: list[dict[str, str]]) -> str:
         response = self._client.chat.completions.create(
-            model=self._chat_model,
+            model=self._settings.chat_model,
             messages=messages,
+            temperature=self._settings.temperature,
             stream=False,
         )
         return response.choices[0].message.content or ""
@@ -245,18 +290,78 @@ class PlanGenerationService:
             f"so_cau: {request.number_of_questions}",
             f"difficulty: {request.difficulty}",
             f"loai_cau: {types_text}",
+            language_instruction_block(request.language),
         ]
         if skills_text:
             lines.append(f"skills: {skills_text}")
+        if request.document_ids:
+            lines.append(
+                "documentIds (Selected HR docs — ưu tiên coverage/source_files từ các doc này): "
+                + ", ".join(str(d) for d in request.document_ids[:20])
+            )
         if request.hr_note and request.hr_note.strip():
             lines.append(f"hrNote: {request.hr_note.strip()}")
+        content_mode, code_templates = _parse_content_preferences(request.hr_note)
+        lines.append(f"contentMode: {content_mode}")
+        lines.append(f"enabledCodeTemplates: {', '.join(code_templates)}")
 
         lines.append(
-            "\nHướng dẫn: citations phải khớp source_file và chunk_index trong context. "
-            "excerpt trích nguyên văn. Nếu [HỆ THỐNG] hoặc [HR] không có chunk thì "
+            "\nHướng dẫn (SCRUM-392/394): JD là nguồn CHÍNH — citations BẮT BUỘC có "
+            f'source_file="{JD_SOURCE_FILE}" đứng đầu; excerpt JD = đoạn NGUYÊN VĂN '
+            "copy từ jobDescription (substring liên quan role/skills) — giống excerpt Knowledge. "
+            "Knowledge chỉ PHỤ. Mỗi coverage.source_files bắt đầu bằng "
+            f'"{JD_SOURCE_FILE}", thêm file KB sau nếu dùng. '
+            "Citation chunk phải khớp source_file và chunk_index trong context. "
+            "Nếu [HỆ THỐNG] hoặc [HR] không có chunk thì "
             "bỏ qua context đó, không coi đó là lỗi; nếu không có context nào thì "
-            "trả citations là [Không có tài liệu liên quan]."
+            "vẫn giữ citation JD với excerpt từ jobDescription."
         )
+
+        # Studio Plan UI / Apply settings
+        hr = (request.hr_note or "").upper()
+        natural = free_text_language_label(request.language)
+        exclusive = "EXCLUSIVE_FOCUS=1" in hr or "EXCLUSIVE_FOCUS = 1" in hr
+        strict = "STRICT_CORPUS=1" in hr or "STRICT_CORPUS = 1" in hr
+        if "STUDIO_UI_PLAN" in hr or "APPLY_STUDIO_SETTINGS" in hr:
+            coverage_rule = (
+                "- coverage: 1–N items CHỈ ALLOWED_TOPICS / FOCUS_HINTS trong hrNote; "
+                "KHÔNG thêm skill JD lan man (.NET/DB/FE nếu không thuộc topic); "
+                "mỗi coverage có question_count + source_files từ context.\n"
+                if exclusive
+                else (
+                    "- coverage: 1–6 skill CHỈ từ JD text + retrieved Selected chunks "
+                    "(STRICT_CORPUS — không ép ≥4 skill JD); mỗi coverage có question_count + source_files.\n"
+                    if strict
+                    else (
+                        "- coverage: ít nhất 4 skill từ JD+RAG, có question_count; "
+                        "mỗi coverage PHẢI có source_files = danh sách source_file thật từ context [HỆ THỐNG]/[HR] "
+                        "(nếu không có chunk thì source_files=[]).\n"
+                    )
+                )
+            )
+            lines.append(
+                "\n[STUDIO_UI_PLAN / APPLY_STUDIO_SETTINGS — BẮT BUỘC cho UI Studio]\n"
+                f"- difficulty_distribution: phân bổ easy/medium/hard cộng đúng {request.number_of_questions}, "
+                "không dồn hết một mức (trừ khi TARGET_DIFFICULTY / instruction yêu cầu một mức).\n"
+                "- question_type_distribution: ĐÚNG các type trong loai_cau "
+                f"({types_text}), mỗi type count>0 nếu có trong loai_cau, reason bằng {natural}; "
+                "tổng count = total_questions.\n"
+                f"- recommended_question_outline: đúng {request.number_of_questions} item; "
+                f"mỗi item có type/difficulty/skill/focus_area/goal (goal bằng {natural}).\n"
+                + coverage_rule
+                + "- citations: đủ các source_file đã dùng trong coverage.\n"
+                f"- summary: 2–3 câu bằng {natural} mô tả cấu trúc buổi phỏng vấn"
+                + (" — nêu rõ exclusive topic nếu EXCLUSIVE_FOCUS.\n" if exclusive else
+                   " (Technical Foundations / System Design / Problem Solving / Behavioral).\n")
+                + "- Nếu MODE=APPLY_STUDIO_SETTINGS: KHÔNG giữ total_questions/difficulty/types cũ nếu TARGET khác."
+            )
+            if exclusive or strict:
+                lines.append(
+                    "\n[STRICT/EXCLUSIVE — instruction THẮNG JD]: "
+                    "Không giữ coverage cũ ngoài ALLOWED_TOPICS; role_title có thể giữ từ JD nhưng "
+                    "summary/skills/coverage phải khớp instruction + corpus."
+                )
+
         lines.append(
             f"\nMap API (BẮT BUỘC — bạn PHẢI suy luận, không bỏ trống): "
             f"role_title từ JD+RAG; level = difficulty = {request.difficulty}; "
@@ -264,7 +369,7 @@ class PlanGenerationService:
             f"total_questions = {request.number_of_questions}; "
             f"skills = suy từ JD/hrNote/skills HR (ưu tiên HR, bổ sung từ JD nếu thiếu); "
             f"question_type_distribution phân bổ đúng loai_cau: {types_text}; "
-            f"summary và notes bằng tiếng Việt giải thích lý do chọn cấp độ và phân bổ."
+            f"summary và notes bằng {natural} giải thích lý do chọn cấp độ và phân bổ."
         )
         lines.append("\n" + format_retrieved_context(system_chunks, hr_chunks))
         lines.append(
@@ -368,17 +473,27 @@ def _dict_to_plan(
     ]
 
     coverage_raw = plan_data.get("coverage", [])
-    coverage = [
-        SkillCoverageItem(
-            skill=str(item.get("skill", "")),
-            questionCount=int(
-                item.get("question_count", item.get("questionCount", 0))
-            ),
-            focusAreas=item.get("focus_areas", item.get("focusAreas", [])) or [],
+    coverage = []
+    for item in coverage_raw:
+        if not isinstance(item, dict):
+            continue
+        raw_sources = item.get("source_files", item.get("sourceFiles", [])) or []
+        source_files: list[str] = []
+        if isinstance(raw_sources, list):
+            for s in raw_sources:
+                name = str(s).strip()
+                if name and name not in source_files:
+                    source_files.append(name)
+        coverage.append(
+            SkillCoverageItem(
+                skill=str(item.get("skill", "")),
+                questionCount=int(
+                    item.get("question_count", item.get("questionCount", 0))
+                ),
+                focusAreas=item.get("focus_areas", item.get("focusAreas", [])) or [],
+                sourceFiles=source_files,
+            )
         )
-        for item in coverage_raw
-        if isinstance(item, dict)
-    ]
 
     outline_raw = plan_data.get("recommended_question_outline") or plan_data.get(
         "recommendedQuestionOutline", []
@@ -398,6 +513,61 @@ def _dict_to_plan(
 
     raw_citations = plan_data.get("citations", [])
     citations = enrich_citations(parse_citations(raw_citations), chunk_lookup)
+    # SCRUM-392/394: JD luôn đứng đầu + excerpt liên quan role/skills
+    skills_hint = " ".join(
+        str(s) for s in (plan_data.get("skills") or []) if s
+    )
+    plan_hint = " ".join(
+        part
+        for part in [
+            str(plan_data.get("role_title") or plan_data.get("roleTitle") or ""),
+            str(plan_data.get("summary") or ""),
+            skills_hint,
+        ]
+        if part
+    )
+    citations = ensure_jd_primary_citations(
+        citations, request.job_description, hint=plan_hint
+    )
+
+    # SCRUM-369: nếu coverage thiếu source_files → gán từ citations (round-robin / skill match)
+    citation_files = [
+        c.source_file.strip()
+        for c in citations
+        if getattr(c, "source_file", None) and str(c.source_file).strip()
+    ]
+    citation_files = list(dict.fromkeys(citation_files))
+    if citation_files:
+        enriched_coverage: list[SkillCoverageItem] = []
+        for idx, cov in enumerate(coverage):
+            files = list(cov.source_files or [])
+            if not files:
+                # ưu tiên citation có excerpt/skill gần skill name
+                skill_l = (cov.skill or "").lower()
+                matched = [
+                    c.source_file.strip()
+                    for c in citations
+                    if c.source_file
+                    and (
+                        skill_l in (c.excerpt or "").lower()
+                        or skill_l in c.source_file.lower()
+                    )
+                ]
+                matched = list(dict.fromkeys(matched))
+                files = matched[:2] if matched else [citation_files[idx % len(citation_files)]]
+            # SCRUM-392: luôn lead bằng job-description
+            files = ensure_jd_primary_source_files(files)
+            enriched_coverage.append(
+                cov.model_copy(update={"source_files": files})
+            )
+        coverage = enriched_coverage
+    else:
+        coverage = [
+            cov.model_copy(
+                update={"source_files": ensure_jd_primary_source_files(cov.source_files)}
+            )
+            for cov in coverage
+        ]
 
     experience_raw = plan_data.get("experience_level") or plan_data.get("experienceLevel")
     experience_level = require_experience_level_from_llm(experience_raw)
