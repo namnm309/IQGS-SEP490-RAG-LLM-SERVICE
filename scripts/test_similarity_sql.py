@@ -20,7 +20,7 @@ with psycopg.connect(DATABASE_URL, connect_timeout=15) as conn:
     with conn.cursor(row_factory=dict_row) as cur:
         # Lấy 1 embedding có sẵn làm query vector
         cur.execute(
-            "SELECT embedding FROM knowledge_chunks WHERE scope='SYSTEM' LIMIT 1"
+            "SELECT embedding FROM tbl_knowledge_chunks WHERE scope='SYSTEM' LIMIT 1"
         )
         row = cur.fetchone()
         if not row:
@@ -32,7 +32,7 @@ with psycopg.connect(DATABASE_URL, connect_timeout=15) as conn:
             """
             SELECT document_id, chunk_index, scope,
                    1 - (embedding <=> %s::vector) AS score
-            FROM knowledge_chunks
+            FROM tbl_knowledge_chunks
             WHERE scope = 'SYSTEM' AND owner_id IS NULL
             ORDER BY embedding <=> %s::vector
             LIMIT 5

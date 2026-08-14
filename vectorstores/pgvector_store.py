@@ -47,7 +47,7 @@ class PgVectorStore:
 
         now = datetime.now(timezone.utc)
         insert_sql = """
-            INSERT INTO knowledge_chunks (
+            INSERT INTO tbl_knowledge_chunks (
                 id, document_id, owner_id, scope, chunk_index,
                 content, metadata, embedding, created_at
             ) VALUES (
@@ -61,7 +61,7 @@ class PgVectorStore:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
-                        "DELETE FROM knowledge_chunks WHERE document_id = %s",
+                        "DELETE FROM tbl_knowledge_chunks WHERE document_id = %s",
                         (document_id,),
                     )
                     deleted = cur.rowcount
@@ -103,7 +103,7 @@ class PgVectorStore:
 
         now = datetime.now(timezone.utc)
         insert_sql = """
-            INSERT INTO knowledge_chunks (
+            INSERT INTO tbl_knowledge_chunks (
                 id, document_id, owner_id, scope, chunk_index,
                 content, metadata, embedding, created_at
             ) VALUES (
@@ -117,7 +117,7 @@ class PgVectorStore:
             with conn.transaction():
                 with conn.cursor() as cur:
                     cur.execute(
-                        "DELETE FROM knowledge_chunks WHERE document_id = %s",
+                        "DELETE FROM tbl_knowledge_chunks WHERE document_id = %s",
                         (document_id,),
                     )
                     for batch in batches:
@@ -144,7 +144,7 @@ class PgVectorStore:
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM knowledge_chunks WHERE document_id = %s",
+                    "DELETE FROM tbl_knowledge_chunks WHERE document_id = %s",
                     (document_id,),
                 )
                 deleted = cur.rowcount
@@ -157,6 +157,7 @@ class PgVectorStore:
         scope: str,
         owner_id: str | None,
         top_k: int,
+        document_ids: list[str] | None = None,
     ) -> list[RetrievedChunk]:
         self._validate_embedding(query_embedding)
         scope_upper = scope.upper()
@@ -165,6 +166,10 @@ class PgVectorStore:
 
         if scope_upper == "HR" and not owner_id:
             raise ValueError("HR search bắt buộc owner_id")
+
+        # SCRUM-388: filter HR theo document_id Selected (SYSTEM không filter)
+        doc_ids = [d.strip() for d in (document_ids or []) if d and str(d).strip()]
+        use_doc_filter = scope_upper == "HR" and len(doc_ids) > 0
 
         if scope_upper == "SYSTEM":
             sql = """
@@ -176,12 +181,29 @@ class PgVectorStore:
                     owner_id,
                     metadata,
                     1 - (embedding <=> %s::vector) AS score
-                FROM knowledge_chunks
+                FROM tbl_knowledge_chunks
                 WHERE scope = 'SYSTEM' AND owner_id IS NULL
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             """
-            params = [query_embedding, query_embedding, top_k]
+            params: list[object] = [query_embedding, query_embedding, top_k]
+        elif use_doc_filter:
+            sql = """
+                SELECT
+                    document_id,
+                    chunk_index,
+                    content,
+                    scope,
+                    owner_id,
+                    metadata,
+                    1 - (embedding <=> %s::vector) AS score
+                FROM tbl_knowledge_chunks
+                WHERE scope = 'HR' AND owner_id = %s
+                  AND document_id = ANY(%s)
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """
+            params = [query_embedding, owner_id, doc_ids, query_embedding, top_k]
         else:
             sql = """
                 SELECT
@@ -192,7 +214,7 @@ class PgVectorStore:
                     owner_id,
                     metadata,
                     1 - (embedding <=> %s::vector) AS score
-                FROM knowledge_chunks
+                FROM tbl_knowledge_chunks
                 WHERE scope = 'HR' AND owner_id = %s
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
