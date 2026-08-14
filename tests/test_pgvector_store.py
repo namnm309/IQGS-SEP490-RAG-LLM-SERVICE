@@ -63,7 +63,7 @@ def test_upsert_uses_single_transaction(settings: Settings, sample_chunk: ChunkR
 
     assert count == 1
     delete_call = call(
-        "DELETE FROM knowledge_chunks WHERE document_id = %s",
+        "DELETE FROM tbl_knowledge_chunks WHERE document_id = %s",
         ("doc-123",),
     )
     assert delete_call in mock_cursor.execute.call_args_list
@@ -101,7 +101,7 @@ def test_upsert_empty_chunks_still_deletes_in_transaction(settings: Settings) ->
 
     assert count == 0
     mock_cursor.execute.assert_called_once_with(
-        "DELETE FROM knowledge_chunks WHERE document_id = %s",
+        "DELETE FROM tbl_knowledge_chunks WHERE document_id = %s",
         ("doc-123",),
     )
     mock_conn.transaction.assert_called_once()

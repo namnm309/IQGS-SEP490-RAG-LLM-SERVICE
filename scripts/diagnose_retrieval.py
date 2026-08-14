@@ -1,4 +1,4 @@
-"""Diagnostic: knowledge_chunks + retrieval conditions vs RAG similarity SQL."""
+"""Diagnostic: tbl_knowledge_chunks + retrieval conditions vs RAG similarity SQL."""
 from __future__ import annotations
 
 import json
@@ -34,18 +34,18 @@ def section(title: str) -> None:
 
 
 def check_db() -> int:
-    section("1. DATABASE — knowledge_chunks")
+    section("1. DATABASE — tbl_knowledge_chunks")
     issues = 0
     with psycopg.connect(DATABASE_URL, connect_timeout=15) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute("SELECT COUNT(*) AS c FROM knowledge_chunks")
+            cur.execute("SELECT COUNT(*) AS c FROM tbl_knowledge_chunks")
             total = cur.fetchone()["c"]
             print(f"Total chunks: {total}")
 
             cur.execute(
                 """
                 SELECT scope, owner_id IS NULL AS owner_null, COUNT(*) AS c
-                FROM knowledge_chunks GROUP BY scope, owner_id IS NULL ORDER BY scope
+                FROM tbl_knowledge_chunks GROUP BY scope, owner_id IS NULL ORDER BY scope
                 """
             )
             print("By scope / owner_null:", [dict(r) for r in cur.fetchall()])
@@ -53,7 +53,7 @@ def check_db() -> int:
             # Exact SQL RAG uses for SYSTEM retrieve
             cur.execute(
                 """
-                SELECT COUNT(*) AS c FROM knowledge_chunks
+                SELECT COUNT(*) AS c FROM tbl_knowledge_chunks
                 WHERE scope = 'SYSTEM' AND owner_id IS NULL
                 """
             )
@@ -65,7 +65,7 @@ def check_db() -> int:
 
             cur.execute(
                 """
-                SELECT COUNT(*) AS c FROM knowledge_chunks
+                SELECT COUNT(*) AS c FROM tbl_knowledge_chunks
                 WHERE scope = 'SYSTEM' AND owner_id IS NOT NULL
                 """
             )
@@ -76,7 +76,7 @@ def check_db() -> int:
 
             cur.execute(
                 """
-                SELECT COUNT(*) AS c FROM knowledge_chunks
+                SELECT COUNT(*) AS c FROM tbl_knowledge_chunks
                 WHERE embedding IS NULL
                 """
             )
@@ -89,7 +89,7 @@ def check_db() -> int:
             cur.execute(
                 """
                 SELECT vector_dims(embedding) AS dims, COUNT(*) AS c
-                FROM knowledge_chunks
+                FROM tbl_knowledge_chunks
                 WHERE embedding IS NOT NULL
                 GROUP BY vector_dims(embedding)
                 """
@@ -99,7 +99,7 @@ def check_db() -> int:
             cur.execute(
                 """
                 SELECT id, scope, status, owner_id, file_name
-                FROM knowledge_documents ORDER BY created_at
+                FROM tbl_knowledge_documents ORDER BY created_at
                 """
             )
             print("Documents:")

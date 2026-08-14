@@ -42,7 +42,7 @@ def main() -> int:
                 tables = [r[0] for r in cur.fetchall()]
                 print(f"TABLES ({len(tables)}): {', '.join(tables)}")
 
-                for tbl in ("knowledge_chunks", "knowledge_documents"):
+                for tbl in ("tbl_knowledge_chunks", "tbl_knowledge_documents"):
                     cur.execute(
                         """
                         SELECT EXISTS (

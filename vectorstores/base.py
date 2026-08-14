@@ -39,4 +39,5 @@ class VectorStore(Protocol):
         scope: str,
         owner_id: str | None,
         top_k: int,
+        document_ids: list[str] | None = None,
     ) -> list[RetrievedChunk]: ...
