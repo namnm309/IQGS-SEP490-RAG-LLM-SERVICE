@@ -111,6 +111,17 @@ class JobGenerationBaseRequest(BaseModel):
     )
     skills: list[str] = Field(default_factory=list)
     hr_note: str | None = Field(default=None, alias="hrNote", max_length=2000)
+    language: str | None = Field(
+        default=None,
+        alias="language",
+        description="Vietnamese | English — ngôn ngữ free-text đầu ra",
+    )
+    # SCRUM-388: KnowledgeDocumentIds Studio Selected → filter HR chunks
+    document_ids: list[str] = Field(
+        default_factory=list,
+        alias="documentIds",
+        description="Optional HR knowledge document IDs to restrict retrieval",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -172,6 +183,14 @@ class GeneratedQuestionItem(BaseModel):
     evaluation_criteria: list[str] = Field(
         default_factory=list, alias="evaluationCriteria"
     )
+    code_template_type: str | None = Field(default=None, alias="codeTemplateType")
+    code_snippet: str | None = Field(default=None, alias="codeSnippet")
+    # Gợi ý text cho HR nên tìm/đính kèm hình nào — không phải AI gen ảnh
+    image_hint: str | None = Field(default=None, alias="imageHint")
+    # SCRUM-400: Candidate UI — Text (textarea) | Code (ô nhập code)
+    answer_method: Literal["Text", "Code"] | None = Field(
+        default=None, alias="answerMethod"
+    )
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
@@ -205,6 +224,8 @@ class SkillCoverageItem(BaseModel):
     skill: str
     question_count: int = Field(..., alias="questionCount")
     focus_areas: list[str] = Field(default_factory=list, alias="focusAreas")
+    # SCRUM-369: tên file RAG (source_file) gắn với focus — Studio UI hiển thị
+    source_files: list[str] = Field(default_factory=list, alias="sourceFiles")
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
@@ -269,6 +290,11 @@ class GenerateQuestionsFromPlanRequest(BaseModel):
     job_description: str = Field(..., alias="jobDescription")
     approved_plan: QuestionGenerationPlan = Field(..., alias="approvedPlan")
     hr_note: str | None = Field(default=None, alias="hrNote", max_length=2000)
+    language: str | None = Field(
+        default=None,
+        alias="language",
+        description="Vietnamese | English — ngôn ngữ câu hỏi sinh ra",
+    )
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -310,6 +336,43 @@ class HealthResponse(BaseModel):
     status: Literal["ok", "degraded"]
     database: Literal["up", "down"]
     config: Literal["valid", "invalid"]
+    # SCRUM-378 — thông tin runtime đang active (không trả API key)
+    chat_model: str | None = Field(default=None, alias="chatModel")
+    ollama_base_url: str | None = Field(default=None, alias="ollamaBaseUrl")
+    temperature: float | None = None
+    top_k_system: int | None = Field(default=None, alias="topKSystem")
+    top_k_hr: int | None = Field(default=None, alias="topKHr")
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class RagModelItem(BaseModel):
+    name: str
+    size: int | None = None
+    digest: str | None = None
+    is_cloud: bool = Field(False, alias="isCloud")
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class RagModelsListResponse(BaseModel):
+    models: list[RagModelItem] = Field(default_factory=list)
+    error_message: str | None = Field(default=None, alias="errorMessage")
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class ReloadConfigResponse(BaseModel):
+    success: bool = True
+    applied: bool = False
+    connection_changed: bool = Field(False, alias="connectionChanged")
+    chat_model: str | None = Field(default=None, alias="chatModel")
+    ollama_base_url: str | None = Field(default=None, alias="ollamaBaseUrl")
+    temperature: float | None = None
+    top_k_system: int | None = Field(default=None, alias="topKSystem")
+    top_k_hr: int | None = Field(default=None, alias="topKHr")
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
 
 class ValidateJdRequest(BaseModel):
@@ -340,6 +403,23 @@ class ParseJdResponse(BaseModel):
     file_name: str | None = Field(default=None, alias="fileName")
     warnings: list[str] = Field(default_factory=list)
     stats: dict | None = None
+    error: str | None = None
+    detail: str | None = None
+    stage: str | None = None
+    exception_type: str | None = Field(default=None, alias="exceptionType")
+    errors: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class ParseCvResponse(BaseModel):
+    """Kết quả parse CV (SCRUM-300) — khớp ParseCvResult phía Backend .NET."""
+
+    success: bool
+    skills: list[str] = Field(default_factory=list)
+    summary: str | None = None
+    file_name: str | None = Field(default=None, alias="fileName")
+    warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     detail: str | None = None
     stage: str | None = None
@@ -422,6 +502,52 @@ class EvaluateAnswerResponse(BaseModel):
     improvements: list[str] = Field(default_factory=list)
     suggestion: str | None = None
     dimension_scores: dict[str, float] | None = Field(default=None, alias="dimensionScores")
+    processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
+    error: str | None = None
+    detail: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+# ── Practice Session Insight (SCRUM-305) — nhận xét tổng quan + skills ───────
+
+
+class QuestionInsightSummary(BaseModel):
+    """Tóm tắt 1 câu đã chấm — BE gửi sang RAG để sinh insight phiên."""
+
+    question_type: str | None = Field(default=None, alias="questionType")
+    skill: str | None = None
+    score: float | None = None
+    strengths: list[str] = Field(default_factory=list)
+    improvements: list[str] = Field(default_factory=list)
+    dimension_scores: dict[str, float] | None = Field(default=None, alias="dimensionScores")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PracticeSessionInsightRequest(BaseModel):
+    """Input BE khi complete phiên practice — sinh AI Insight song ngữ."""
+
+    overall_score: float | None = Field(default=None, alias="overallScore")
+    total_questions: int = Field(..., alias="totalQuestions")
+    answered_count: int = Field(..., alias="answeredCount")
+    set_title: str | None = Field(default=None, alias="setTitle")
+    set_skills: list[str] = Field(default_factory=list, alias="setSkills")
+    question_summaries: list[QuestionInsightSummary] = Field(
+        default_factory=list, alias="questionSummaries"
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class PracticeSessionInsightResponse(BaseModel):
+    """Nhận xét tổng quan + kỹ năng cần cải thiện (Vi/En)."""
+
+    success: bool = True
+    insight_vi: str | None = Field(default=None, alias="insightVi")
+    insight_en: str | None = Field(default=None, alias="insightEn")
+    skills_to_improve_vi: list[str] = Field(default_factory=list, alias="skillsToImproveVi")
+    skills_to_improve_en: list[str] = Field(default_factory=list, alias="skillsToImproveEn")
     processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
     error: str | None = None
     detail: str | None = None
