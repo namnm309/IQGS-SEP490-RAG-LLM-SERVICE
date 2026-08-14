@@ -139,7 +139,12 @@ def test_generate_from_plan_falls_back_to_plan_when_no_retrieved_chunks(
 
     assert result.success is True
     assert len(result.questions) == 1
-    assert result.questions[0].citations == []
+    # SCRUM-392/394: không có KB chunk vẫn phải có citation JD + excerpt
+    assert len(result.questions[0].citations) == 1
+    jd_cit = result.questions[0].citations[0]
+    assert jd_cit.source_file == "job-description"
+    assert jd_cit.excerpt
+    assert "Backend" in jd_cit.excerpt or ".NET" in jd_cit.excerpt
     assert service._client.chat.completions.create.call_count == 1
 
 
@@ -176,4 +181,5 @@ def test_generate_from_plan_count_mismatch(
     result = service.generate_from_plan(request)
 
     assert result.success is False
-    assert "totalQuestions" in (result.error or "")
+    assert result.error is not None
+    assert "không khớp" in result.error.lower() or "totalQuestions" in result.error
