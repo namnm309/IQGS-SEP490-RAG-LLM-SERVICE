@@ -40,7 +40,13 @@ app.add_exception_handler(Exception, unhandled_exception_handler)
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 def health() -> HealthResponse:
-    settings = get_settings()
+    try:
+        settings = deps.get_settings_ref()
+        deps.refresh_runtime_config(force=False)
+        settings = deps.get_settings_ref()
+    except Exception:
+        settings = get_settings()
+
     config_valid = bool(
         settings.database_url
         and settings.internal_api_key
@@ -61,4 +67,9 @@ def health() -> HealthResponse:
         status=overall,
         database=database_status,
         config="valid" if config_valid else "invalid",
+        chat_model=settings.chat_model,
+        ollama_base_url=settings.ollama_base_url,
+        temperature=settings.temperature,
+        top_k_system=settings.top_k_system,
+        top_k_hr=settings.top_k_hr,
     )
