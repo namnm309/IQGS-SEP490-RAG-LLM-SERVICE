@@ -123,7 +123,7 @@ class EvaluateAnswerService:
         response = self._client.chat.completions.create(
             model=self._settings.chat_model,
             messages=messages,
-            temperature=0.3,
+            temperature=self._settings.temperature,
         )
         return (response.choices[0].message.content or "").strip()
 
