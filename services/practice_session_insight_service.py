@@ -28,9 +28,11 @@ PRACTICE_SESSION_INSIGHT_SYSTEM_PROMPT = """Bạn là giám khảo phỏng vấn
    - Ưu tiên vùng điểm thấp, skill tag, questionType, dimensionScores yếu.
    - Không bịa kỹ năng ngoài context bộ câu hỏi / setSkills.
    - Tên kỹ năng ngắn gọn (vd. "C# / .NET", "Giao tiếp kỹ thuật").
-4. Nếu answeredCount = 0 hoặc answeredCount << totalQuestions: insight nên nhắc hoàn thành nhiều câu hơn;
-   skillsToImprove lấy từ setSkills hoặc phân bố questionType của các câu đã chấm / còn lại.
-5. Chỉ trả về JSON hợp lệ, không markdown fence, không text ngoài JSON.
+4. Nếu answeredCount = 0 hoặc answeredCount << totalQuestions: insight PHẢI nêu rõ đã làm X/Y câu;
+   không được viết như đã làm cả bộ. skillsToImprove lấy từ setSkills hoặc các câu đã chấm.
+5. Câu không nằm trong questionSummaries là câu CHƯA làm (trống / quá ngắn, không chấm AI).
+   KHÔNG nhận xét những câu đó là "trả lời quá ngắn" hay "thiếu chi tiết".
+6. Chỉ trả về JSON hợp lệ, không markdown fence, không text ngoài JSON.
 
 ## Schema JSON
 {

@@ -1100,6 +1100,14 @@ def _validate_questions_against_plan(
 ) -> str | None:
     target = expected_count if expected_count is not None else plan.total_questions
     got = len(questions)
+    if got > target:
+        del questions[target:]
+        logger.warning(
+            "trimmed extra questions: got=%s expected=%s", got, target
+        )
+        for i, q in enumerate(questions, start=1):
+            q.order = i
+        got = target
     if got != target:
         # Full generation: chấp nhận thiếu/thừa nhẹ (±2 hoặc ≥ 2/3) để tránh fail cả job
         if not strict_count:
