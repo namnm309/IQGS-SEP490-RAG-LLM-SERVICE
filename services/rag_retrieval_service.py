@@ -53,3 +53,26 @@ class RagRetrievalService:
             document_ids=document_ids,
         )
         return system_chunks, hr_chunks
+
+    def retrieve_system_only(
+        self,
+        query_text: str,
+        *,
+        top_k_system: int | None = None,
+        query_extra: str | None = None,
+    ) -> list[RetrievedChunk]:
+        """Retrieve chỉ SYSTEM — luồng Candidate không dùng HR knowledge theo owner."""
+        parts = [query_text.strip()]
+        if query_extra and query_extra.strip():
+            extra = query_extra.strip()
+            if len(extra) > 1500:
+                extra = extra[:1500]
+            parts.append(extra)
+        query_embedding = self._embedding.embed_query("\n\n".join(parts))
+        return self._store.similarity_search(
+            query_embedding,
+            scope="SYSTEM",
+            owner_id=None,
+            top_k=top_k_system or self._settings.top_k_system,
+            document_ids=None,
+        )
