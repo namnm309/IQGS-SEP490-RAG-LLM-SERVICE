@@ -315,6 +315,7 @@ X-Internal-Api-Key: <INTERNAL_API_KEY>
 | `POST` | `/internal/rag/generate-questions-from-plan/async` | Async | **202** | Production question generation |
 | `POST` | `/internal/rag/generate-questions` | Sync | 200 | **Dev shortcut:** JD → questions (bỏ plan) |
 | `POST` | `/internal/rag/question-assist` | Sync | 200 | Ask AI per question (không vector search) |
+| `POST` | `/internal/rag/evaluate-question-set` | Sync | 200 | Đánh giá bộ câu hỏi vs JD — verdict lời, không điểm số |
 | `DELETE` | `/internal/rag/documents/{documentId}` | Sync | 200 / **500** | Xóa tất cả chunks theo document |
 
 ### 6.3 Response models chính
@@ -330,6 +331,7 @@ X-Internal-Api-Key: <INTERNAL_API_KEY>
 | `/generate-plan` | `GeneratePlanResponse` | `success`, `plan`, `processingTimeMs`, `error` |
 | `/generate-questions-from-plan` | `GenerateQuestionsFromPlanResponse` | `success`, `questions`, `processingTimeMs`, `error` |
 | `/question-assist` | `QuestionAssistResponse` | `success`, `assistantMessage`, `suggestion` |
+| `/evaluate-question-set` | `EvaluateQuestionSetResponse` | `success`, `verdict`, `summaryVi`/`summaryEn`, `questionFlags` |
 | `/health` | `HealthResponse` | `status`, `database`, `configValid` |
 
 ### 6.4 Callback endpoints (RAG → Backend)
@@ -677,6 +679,7 @@ sequenceDiagram
 | `QuestionGenerationJobService` | `ApplicationLayer/Services/...` | `POST /parse-jd` |
 | `CandidateCvService` | `ApplicationLayer/Services/CandidateCvService.cs` | `POST /parse-cv` |
 | `QuestionAiAssistService` | `ApplicationLayer/Services/...` | `POST /question-assist` |
+| `QuestionSetJdFitService` | `ApplicationLayer/Services/QuestionSetJdFitService.cs` | `POST /evaluate-question-set` |
 | `KnowledgeDocumentService` | delete flow | `DELETE /documents/{id}` |
 | `RagService` (HttpClient) | `InfrastructureLayer/External/RagService.cs` | Tất cả endpoints trên |
 | `AdminRagStatusController` | `WebAPI/Controllers/Admin/...` | Proxy `GET /health` |
