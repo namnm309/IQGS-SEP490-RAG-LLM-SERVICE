@@ -299,6 +299,20 @@ class GenerateQuestionsFromPlanRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
+class CandidateGeneratePlanRequest(GeneratePlanRequest):
+    """Luồng Candidate: plan luyện tập, không phải plan HR duyệt."""
+
+    audience: str = Field(default="jd_practice", alias="audience")
+    cv_context: str | None = Field(default=None, alias="cvContext")
+    candidate_note: str | None = Field(default=None, alias="candidateNote", max_length=2000)
+
+
+class CandidateGenerateQuestionsFromPlanRequest(GenerateQuestionsFromPlanRequest):
+    audience: str = Field(default="jd_practice", alias="audience")
+    cv_context: str | None = Field(default=None, alias="cvContext")
+    candidate_note: str | None = Field(default=None, alias="candidateNote", max_length=2000)
+
+
 class GenerateQuestionsFromPlanAsyncRequest(GenerateQuestionsFromPlanRequest):
     job_id: str = Field(..., alias="jobId")
 
@@ -548,6 +562,82 @@ class PracticeSessionInsightResponse(BaseModel):
     insight_en: str | None = Field(default=None, alias="insightEn")
     skills_to_improve_vi: list[str] = Field(default_factory=list, alias="skillsToImproveVi")
     skills_to_improve_en: list[str] = Field(default_factory=list, alias="skillsToImproveEn")
+    processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
+    error: str | None = None
+    detail: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+# ── JD Fit Review — qualitative only (no numeric scores) ─────────────────────
+
+JD_FIT_VERDICTS = frozenset({"unfit", "fair", "good", "excellent"})
+JD_FIT_FLAGS = frozenset({"onJd", "weak", "offJd", "duplicate"})
+JD_FIT_ACTION_TYPES = frozenset({"add", "rewrite", "remove"})
+
+
+class EvaluateQuestionSetItem(BaseModel):
+    question_id: str | None = Field(default=None, alias="questionId")
+    order: int | None = None
+    question: str
+    question_type: str | None = Field(default=None, alias="questionType")
+    difficulty: str | None = None
+    skill: str | None = None
+    focus_area: str | None = Field(default=None, alias="focusArea")
+    rationale: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class EvaluateQuestionSetRequest(BaseModel):
+    owner_id: str | None = Field(default=None, alias="ownerId")
+    job_description: str = Field(..., alias="jobDescription")
+    hr_note: str | None = Field(default=None, alias="hrNote")
+    set_title: str | None = Field(default=None, alias="setTitle")
+    plan: dict | list | None = None
+    questions: list[EvaluateQuestionSetItem]
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class JdFitSourceItem(BaseModel):
+    chunk_index: int = Field(..., alias="chunkIndex")
+    excerpt: str = ""
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class JdFitQuestionFlagItem(BaseModel):
+    question_id: str | None = Field(default=None, alias="questionId")
+    order: int | None = None
+    flag: str
+    note_vi: str | None = Field(default=None, alias="noteVi")
+    note_en: str | None = Field(default=None, alias="noteEn")
+    sources: list[JdFitSourceItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class JdFitSuggestedActionItem(BaseModel):
+    type: str
+    question_id: str | None = Field(default=None, alias="questionId")
+    reason_vi: str | None = Field(default=None, alias="reasonVi")
+    reason_en: str | None = Field(default=None, alias="reasonEn")
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class EvaluateQuestionSetResponse(BaseModel):
+    success: bool = True
+    verdict: str | None = None
+    summary_vi: str | None = Field(default=None, alias="summaryVi")
+    summary_en: str | None = Field(default=None, alias="summaryEn")
+    question_flags: list[JdFitQuestionFlagItem] = Field(default_factory=list, alias="questionFlags")
+    missing_topics: list[str] = Field(default_factory=list, alias="missingTopics")
+    suggested_actions: list[JdFitSuggestedActionItem] = Field(
+        default_factory=list, alias="suggestedActions"
+    )
+    jd_sources: list[JdFitSourceItem] = Field(default_factory=list, alias="jdSources")
     processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
     error: str | None = None
     detail: str | None = None

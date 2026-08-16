@@ -6,9 +6,12 @@ from api.deps import (
     get_async_ingest_service,
     get_cv_parse_service,
     get_evaluate_answer_service,
+    get_evaluate_question_set_service,
     get_ingest_service,
     get_jd_parse_service,
     get_plan_service,
+    get_candidate_plan_service,
+    get_candidate_question_service,
     get_practice_session_insight_service,
     get_question_assist_service,
     get_question_service,
@@ -20,12 +23,16 @@ from models.internal_schemas import (
     DeleteDocumentResponse,
     EvaluateAnswerRequest,
     EvaluateAnswerResponse,
+    EvaluateQuestionSetRequest,
+    EvaluateQuestionSetResponse,
     GeneratePlanAsyncRequest,
     GeneratePlanRequest,
     GeneratePlanResponse,
     GenerateQuestionsFromPlanAsyncRequest,
     GenerateQuestionsFromPlanRequest,
     GenerateQuestionsFromPlanResponse,
+    CandidateGeneratePlanRequest,
+    CandidateGenerateQuestionsFromPlanRequest,
     GenerateQuestionsRequest,
     GenerateQuestionsResponse,
     IngestRequest,
@@ -47,8 +54,11 @@ from services.async_generation_service import AsyncGenerationService
 from services.async_ingest_service import AsyncIngestService
 from services.cv_parse_service import CvParseService
 from services.evaluate_answer_service import EvaluateAnswerService
+from services.evaluate_question_set_service import EvaluateQuestionSetService
 from services.jd_parse_service import JdParseService
 from services.plan_generation_service import PlanGenerationService
+from services.candidate_plan_generation_service import CandidatePlanGenerationService
+from services.candidate_question_generation_service import CandidateQuestionGenerationService
 from services.practice_session_insight_service import PracticeSessionInsightService
 from services.question_assist_service import QuestionAssistService
 from services.question_generation_service import QuestionGenerationService
@@ -177,6 +187,30 @@ def generate_questions_from_plan(
 
 
 @router.post(
+    "/candidate/generate-plan",
+    response_model=GeneratePlanResponse,
+    response_model_exclude_none=True,
+)
+def candidate_generate_plan(
+    request: CandidateGeneratePlanRequest,
+    service: CandidatePlanGenerationService = Depends(get_candidate_plan_service),
+) -> GeneratePlanResponse:
+    return service.generate(request)
+
+
+@router.post(
+    "/candidate/generate-questions-from-plan",
+    response_model=GenerateQuestionsFromPlanResponse,
+    response_model_exclude_none=True,
+)
+def candidate_generate_questions_from_plan(
+    request: CandidateGenerateQuestionsFromPlanRequest,
+    service: CandidateQuestionGenerationService = Depends(get_candidate_question_service),
+) -> GenerateQuestionsFromPlanResponse:
+    return service.generate_from_plan(request)
+
+
+@router.post(
     "/generate-questions-from-plan/async",
     response_model=AsyncAcceptedResponse,
     status_code=202,
@@ -230,6 +264,19 @@ def evaluate_answer(
     service: EvaluateAnswerService = Depends(get_evaluate_answer_service),
 ) -> EvaluateAnswerResponse:
     """Chấm điểm câu trả lời Candidate theo rubric (SCRUM-281)."""
+    return service.evaluate(request)
+
+
+@router.post(
+    "/evaluate-question-set",
+    response_model=EvaluateQuestionSetResponse,
+    response_model_exclude_none=True,
+)
+def evaluate_question_set(
+    request: EvaluateQuestionSetRequest,
+    service: EvaluateQuestionSetService = Depends(get_evaluate_question_set_service),
+) -> EvaluateQuestionSetResponse:
+    """Đánh giá bộ câu hỏi so với JD — chỉ nhận xét lời, không điểm số."""
     return service.evaluate(request)
 
 

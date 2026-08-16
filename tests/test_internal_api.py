@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from api.app import app
 from config.settings import Settings
-from models.internal_schemas import IngestRequest, IngestResponse
+from models.internal_schemas import GeneratePlanResponse, GenerateQuestionsFromPlanResponse, IngestRequest, IngestResponse
 from services.rag_ingest_service import RagIngestService
 from vectorstores.base import ChunkRecord, RetrievedChunk
 
@@ -58,7 +58,7 @@ def client(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> TestClient:
         processing_time_ms=1.0,
         error=None,
     )
-    mock_question.generate_from_plan.return_value = MagicMock(
+    mock_question.generate_from_plan.return_value = GenerateQuestionsFromPlanResponse(
         success=True,
         questions=[],
         processing_time_ms=1.0,
@@ -66,7 +66,7 @@ def client(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> TestClient:
     )
 
     mock_plan = MagicMock()
-    mock_plan.generate.return_value = MagicMock(
+    mock_plan.generate.return_value = GeneratePlanResponse(
         success=True,
         plan=None,
         processing_time_ms=1.0,
@@ -84,6 +84,8 @@ def client(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> TestClient:
     deps._ingest_service = mock_ingest
     deps._question_service = mock_question
     deps._plan_service = mock_plan
+    deps._candidate_question_service = mock_question
+    deps._candidate_plan_service = mock_plan
     deps._openai_client = MagicMock()
 
     monkeypatch.setattr(deps, "refresh_runtime_config", lambda force=False: {
@@ -290,6 +292,55 @@ def test_generate_questions_from_plan_requires_api_key(client: TestClient) -> No
     assert response.status_code == 401
 
 
+def test_candidate_generate_plan_requires_api_key(client: TestClient) -> None:
+    response = client.post(
+        "/internal/rag/candidate/generate-plan",
+        json={
+            "ownerId": "11111111-1111-1111-1111-111111111111",
+            "jobDescription": "Backend role",
+            "numberOfQuestions": 5,
+        },
+    )
+    assert response.status_code == 401
+
+
+def test_candidate_generate_plan_with_api_key(client: TestClient, settings: Settings) -> None:
+    response = client.post(
+        "/internal/rag/candidate/generate-plan",
+        headers={"X-Internal-Api-Key": settings.internal_api_key},
+        json={
+            "ownerId": "11111111-1111-1111-1111-111111111111",
+            "jobDescription": "Backend role",
+            "numberOfQuestions": 5,
+            "questionTypes": ["technical"],
+            "audience": "jd_practice",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["success"] is True
+
+
+def test_candidate_generate_questions_from_plan_with_api_key(
+    client: TestClient, settings: Settings
+) -> None:
+    response = client.post(
+        "/internal/rag/candidate/generate-questions-from-plan",
+        headers={"X-Internal-Api-Key": settings.internal_api_key},
+        json={
+            "ownerId": "11111111-1111-1111-1111-111111111111",
+            "jobDescription": "Backend role",
+            "audience": "coach",
+            "cvContext": "Skills: C#, ASP.NET",
+            "approvedPlan": {
+                "roleTitle": "CV check",
+                "experienceLevel": "junior",
+                "totalQuestions": 1,
+                "questionTypeDistribution": [
+                    {"type": "technical", "count": 1, "reason": "CV"}
+                ],
+            },
+        },
+    )
     assert response.status_code == 200
     assert response.json()["success"] is True
 
