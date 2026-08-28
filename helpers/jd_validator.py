@@ -38,6 +38,68 @@ SIGNAL_GROUPS = [
     )),
 ]
 
+# SCRUM-416: domain IT — đồng bộ với BE JobDescriptionValidator (keyword bilingual).
+IT_ROLE_KEYWORDS = [
+    "software engineer", "software developer", "backend", "front-end", "frontend", "full stack",
+    "fullstack", "full-stack", "devops", "sre", "site reliability", "data engineer", "data scientist",
+    "machine learning", "ml engineer", "ai engineer", "qa engineer", "test engineer", "quality assurance",
+    "mobile developer", "ios developer", "android developer", "security engineer", "cybersecurity",
+    "cloud engineer", "platform engineer", "database administrator", "dba", "system admin", "sysadmin",
+    "it support", "technical lead", "tech lead", "solution architect", "software architect", "embedded",
+    "lập trình viên", "kỹ sư phần mềm", "nhà phát triển", "phát triển phần mềm", "lập trình",
+    "kiểm thử phần mềm", "kỹ sư qa", "kỹ sư dữ liệu",
+]
+
+IT_TECH_KEYWORDS = [
+    ".net", "asp.net", "c#", "csharp", "java", "spring boot", "python", "django", "fastapi", "flask",
+    "javascript", "typescript", "react", "next.js", "nextjs", "angular", "vue", "node.js", "nodejs",
+    "golang", "go lang", "rust", "kotlin", "swift", "php", "laravel", "ruby on rails",
+    "sql", "postgresql", "postgres", "mysql", "mongodb", "redis", "elasticsearch",
+    "docker", "kubernetes", "k8s", "ci/cd", "jenkins", "github actions", "gitlab ci",
+    "aws", "azure", "gcp", "google cloud", "terraform", "ansible",
+    "rest api", "graphql", "microservices", "kafka", "rabbitmq", "grpc",
+    "git", "linux", "api gateway", "unit test", "xunit", "junit", "pytest",
+    "html", "css", "tailwind", "webpack",
+]
+
+NON_IT_KEYWORDS = [
+    "marketing", "digital marketing", "content marketing", "seo specialist", "social media",
+    "sales executive", "sales manager", "account executive", "business development",
+    "kế toán", "accountant", "accounting", "bookkeeper", "kiểm toán", "auditor",
+    "luật sư", "lawyer", "legal counsel", "pháp chế",
+    "giáo viên", "teacher", "giảng viên", "nhân viên y tế", "bác sĩ", "nurse", "điều dưỡng",
+    "nhà hàng", "restaurant", "pha chế", "bartender", "khách sạn", "hotel receptionist",
+    "bất động sản", "real estate", "môi giới",
+    "nhân viên bán hàng", "cashier", "thu ngân", "warehouse picker",
+    "lễ tân", "receptionist", "fashion designer", "thiết kế thời trang", "makeup artist",
+]
+
+
+def _score_keywords(lower: str, keywords: list[str]) -> int:
+    return sum(1 for kw in keywords if kw in lower)
+
+
+def validate_it_domain(text: str) -> str | None:
+    """Trả về message lỗi nếu JD không thuộc IT; None nếu OK."""
+    lower = (text or "").lower()
+    it_score = _score_keywords(lower, IT_ROLE_KEYWORDS) + _score_keywords(lower, IT_TECH_KEYWORDS)
+    non_it_score = _score_keywords(lower, NON_IT_KEYWORDS)
+
+    if it_score == 0:
+        return (
+            "Hệ thống chỉ nhận Job Description thuộc lĩnh vực IT/phần mềm. "
+            "JD này không có tín hiệu kỹ thuật đủ rõ (vai trò IT hoặc công nghệ như .NET, React, Java, SQL…)."
+        )
+
+    if non_it_score > it_score:
+        return (
+            "Hệ thống chỉ nhận Job Description thuộc lĩnh vực IT/phần mềm. "
+            "JD này nghiêng về ngành ngoài IT (ví dụ marketing, sales, kế toán, luật…). "
+            "Vui lòng dùng JD kỹ thuật/phần mềm."
+        )
+
+    return None
+
 
 def _count_words(text: str) -> int:
     return len(re.findall(r"\S+", text))
@@ -153,6 +215,11 @@ def validate_jd_text(text: str, file_name: str, config: dict) -> JdValidationRes
             "JD chỉ đáp ứng tối thiểu 2/4 nhóm thông tin. "
             "Nên bổ sung thêm chi tiết để plan chính xác hơn."
         )
+
+    # SCRUM-416: chỉ nhận JD IT/phần mềm (đồng bộ BE).
+    it_error = validate_it_domain(normalized)
+    if it_error:
+        errors.append(it_error)
 
     return JdValidationResult(
         valid=len(errors) == 0,

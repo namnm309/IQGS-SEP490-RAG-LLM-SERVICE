@@ -92,6 +92,42 @@ def test_validate_jd_too_short(settings: Settings):
     assert len(result.errors) >= 1
 
 
+def test_validate_jd_rejects_non_it_domain(settings: Settings):
+    """SCRUM-416: JD marketing đủ dài/cấu trúc nhưng ngoài IT → fail."""
+    from helpers.jd_validator import validate_jd_text
+    from models.internal_schemas import ValidateJdRequest
+
+    marketing = """
+Job Description - Digital Marketing Executive
+
+Vị trí: Digital Marketing Executive
+
+Trách nhiệm:
+- Lập kế hoạch content marketing và social media campaign.
+- Tối ưu SEO, theo dõi KPI chuyển đổi bán hàng.
+- Phối hợp sales manager và business development team.
+
+Yêu cầu:
+- Kinh nghiệm marketing, SEO specialist, content marketing.
+- Kỹ năng viết bài và quản lý fanpage thương hiệu.
+
+Level: Junior level, 1+ years experience required.
+""" + (" chi tiết " * 80)
+
+    service = JdParseService(DocumentParser(), settings)
+    result = service.validate_text(
+        ValidateJdRequest(jobDescription=marketing, fileName="marketing.txt")
+    )
+    assert result.success is False
+    assert result.stage == "JD_VALIDATION"
+    assert any("IT" in e or "phần mềm" in e for e in result.errors)
+
+    # Unit trực tiếp helper
+    direct = validate_jd_text(marketing, "marketing.txt", {})
+    assert direct.valid is False
+    assert any("IT" in e or "phần mềm" in e for e in direct.errors)
+
+
 def test_parse_jd_txt_success(client: TestClient):
     files = {"file": ("jd.txt", VALID_JD_TEXT.encode("utf-8"), "text/plain")}
     response = client.post(
