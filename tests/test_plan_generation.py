@@ -407,3 +407,49 @@ def test_generate_plan_validation_fail_wrong_total(
     assert result.success is False
     assert result.plan is None
     assert "totalQuestions" in (result.detail or "")
+
+
+def test_generate_plan_studio_fails_without_hr_experience_level(
+    settings: Settings,
+) -> None:
+    """Studio (STUDIO_UI_PLAN=1): thiếu experienceLevel → fail sớm, không gọi LLM."""
+    service = _make_service(settings, [_valid_plan_json(2)], None)
+    request = GeneratePlanRequest(
+        ownerId="11111111-1111-1111-1111-111111111111",
+        jobDescription="Backend .NET role",
+        numberOfQuestions=2,
+        questionTypes=["technical"],
+        hrNote="STUDIO_UI_PLAN=1\nPosition: Backend Developer",
+    )
+
+    result = service.generate(request)
+
+    assert result.success is False
+    assert result.plan is None
+    assert "experienceLevel" in (result.error or "")
+    assert service._client.chat.completions.create.call_count == 0
+
+
+def test_generate_plan_studio_uses_hr_experience_level(
+    settings: Settings, sample_chunk: RetrievedChunk
+) -> None:
+    """Studio: experienceLevel HR được ép vào plan, LLM trả khác → fail validation."""
+    service = _make_service(
+        settings,
+        [_valid_plan_json(2, experience_level="mid")],
+        sample_chunk,
+    )
+    request = GeneratePlanRequest(
+        ownerId="11111111-1111-1111-1111-111111111111",
+        jobDescription="Backend .NET role",
+        numberOfQuestions=2,
+        questionTypes=["technical"],
+        hrNote="STUDIO_UI_PLAN=1",
+        experienceLevel="senior",
+    )
+
+    result = service.generate(request)
+
+    assert result.success is True
+    assert result.plan is not None
+    assert result.plan.experience_level == "senior"

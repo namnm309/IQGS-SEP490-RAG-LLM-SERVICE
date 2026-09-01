@@ -10,7 +10,7 @@ from typing import Any
 from openai import OpenAI
 
 from config.settings import Settings
-from helpers.experience_level_infer import require_experience_level_from_llm
+from helpers.experience_level_infer import resolve_experience_level
 from models.internal_schemas import (
     DifficultyDistributionItem,
     GeneratePlanRequest,
@@ -36,6 +36,8 @@ from services.rag_context_helpers import (
     format_retrieved_context,
     parse_citations,
 )
+from services.plan_provenance_validator import apply_provenance_to_plan_dict
+from services.outline_source_binder import bind_sources_to_outline
 from services.rag_retrieval_service import RagRetrievalService
 from vectorstores.base import RetrievedChunk
 from helpers.language_prompt import free_text_language_label, language_instruction_block
@@ -49,6 +51,17 @@ _DEFAULT_CODE_TEMPLATES = [
     "PERFORMANCE_ANALYSIS",
     "SYSTEM_DESIGN",
 ]
+
+
+def _has_focus_hints(hr_note: str | None) -> bool:
+    note = (hr_note or "").upper()
+    return "FOCUS_HINTS:" in note or "ALLOWED_TOPICS:" in note
+
+
+def _is_studio_plan_request(request: GeneratePlanRequest) -> bool:
+    """Studio HR: hrNote có marker STUDIO_UI_PLAN — experience_level chỉ từ HR."""
+    note = (request.hr_note or "").upper()
+    return "STUDIO_UI_PLAN=1" in note or "STUDIO_UI_PLAN = 1" in note.replace(" ", "")
 
 
 def _parse_content_preferences(hr_note: str | None) -> tuple[str, list[str]]:
@@ -92,17 +105,11 @@ Không để Knowledge thay thế yêu cầu trong JD nếu mâu thuẫn.
 - role_title: tên VỊ TRÍ tuyển dụng suy ra từ JD (ví dụ "Backend Developer") — KHÔNG phải danh sách skills.
 - level: cùng giá trị difficulty (easy|medium|hard) — phải khớp difficulty HR yêu cầu.
 - difficulty: cùng giá trị level.
-- experience_level: BẮT BUỘC — cấp ứng viên mà bộ câu hỏi phù hợp (intern|junior|mid|senior|lead). KHÔNG được null hoặc bỏ trống.
-  Suy ra từ JD/hrNote theo bảng:
-  | Tín hiệu trong JD | experience_level |
-  | Thực tập, intern, fresher | intern |
-  | 0-1 năm, junior, mới ra trường | junior |
-  | 2-4 năm, 1-3 năm, 3-5 năm kinh nghiệm | mid |
-  | Senior, 5+ năm | senior |
-  | Lead, Principal, Architect | lead |
-  Ví dụ: "Backend Developer có 2–4 năm kinh nghiệm" → experience_level = "mid".
+- experience_level: BẮT BUỘC — cấp ứng viên (intern|junior|mid|senior|lead). KHÔNG được null.
+  • Nếu user message có experienceLevel (HR đã xác nhận trên Studio): plan.experience_level PHẢI bằng ĐÚNG giá trị đó — KHÔNG suy từ JD, KHÔNG đổi.
+  • Chỉ khi request KHÔNG gửi experienceLevel (luồng legacy): mới được suy từ hrNote/JD.
 - total_questions: đúng số câu HR yêu cầu (so_cau).
-- skills: ưu tiên skills HR gửi, bổ sung từ JD nếu thiếu và liên quan.
+- skills: nếu HR gửi list skills (không rỗng) thì đó là NGUỒN CHÍNH — plan.skills và coverage PHẢI cover các skill đó; KHÔNG thêm skill HR đã bỏ / không có trong list; KHÔNG bịa skill ngoài list. Chỉ khi HR không gửi skills (list rỗng) mới được suy từ JD.
 - question_type_distribution: phân bổ theo loại câu HR yêu cầu (loai_cau); chỉ dùng các type đã cho.
 
 9. experience_level và level là field BẮT BUỘC — thiếu một trong hai thì JSON không hợp lệ.
@@ -197,14 +204,28 @@ class PlanGenerationService:
         if not request.job_description or not request.job_description.strip():
             return self._fail(start, "jobDescription là bắt buộc", "VALIDATION")
 
+        # SCRUM-417: Studio — thiếu experienceLevel HR confirm → lỗi, không gọi LLM suy JD.
+        if _is_studio_plan_request(request) and not request.experience_level:
+            return self._fail(
+                start,
+                "experienceLevel là bắt buộc",
+                "VALIDATION",
+                "HR phải xác nhận cấp độ (Intern|Junior|Mid|Senior|Lead) trước khi tạo plan — "
+                "không suy từ JD.",
+            )
+
         try:
-            # SCRUM-388: filter Selected docs + query JD+hrNote (instruction/focus)
+            # SCRUM-388 / SCRUM-420: filter Selected + query instruction; tăng SYSTEM khi focus
             doc_ids = [str(d).strip() for d in (request.document_ids or []) if str(d).strip()]
+            top_k_system = self._settings.top_k_system
+            if _has_focus_hints(request.hr_note):
+                top_k_system = max(top_k_system, 8)
             system_chunks, hr_chunks = self._retrieval.retrieve_for_job(
                 request.job_description,
                 request.owner_id.strip(),
                 document_ids=doc_ids or None,
                 query_extra=request.hr_note,
+                top_k_system=top_k_system,
             )
         except Exception as exc:
             logger.exception("Retrieval failed")
@@ -259,6 +280,34 @@ class PlanGenerationService:
         if parse_error:
             return self._fail(start, "Lỗi sinh plan", "PLAN_GENERATION", parse_error)
 
+        # SCRUM-426: khóa JD (+ Admin) trên từng outline slot trước khi trả plan
+        try:
+            locked = bind_sources_to_outline(
+                list(plan.recommended_question_outline or []),
+                job_description=request.job_description,
+                chunks=all_chunks,
+                force_rebind=True,
+            )
+            plan = plan.model_copy(update={"recommended_question_outline": locked})
+        except Exception as exc:
+            logger.warning("Outline source bind skipped: %s", exc)
+
+        # SCRUM-420: gắn provenance waterfall sau parse
+        try:
+            plan_dict = plan.model_dump(by_alias=True)
+            plan_dict = apply_provenance_to_plan_dict(
+                plan_dict,
+                chunks=all_chunks,
+                job_description=request.job_description,
+            )
+            if plan_dict.get("skills") and isinstance(plan_dict["skills"][0], dict):
+                plan_dict["skills"] = [
+                    str(s.get("name", s)) for s in plan_dict["skills"] if s
+                ]
+            plan = QuestionGenerationPlan.model_validate(plan_dict)
+        except Exception as exc:
+            logger.warning("Provenance enrich skipped: %s", exc)
+
         return GeneratePlanResponse(
             success=True,
             plan=plan,
@@ -294,14 +343,52 @@ class PlanGenerationService:
         ]
         if skills_text:
             lines.append(f"skills: {skills_text}")
+        if request.experience_level:
+            lines.append(
+                f"experienceLevel (HR đã xác nhận — BẮT BUỘC, KHÔNG suy từ JD): "
+                f"{request.experience_level}"
+            )
+            lines.append(
+                f"plan.experience_level BẮT BUỘC = {request.experience_level} "
+                "(copy đúng giá trị HR — không đổi)."
+            )
+        elif _is_studio_plan_request(request):
+            lines.append(
+                "experienceLevel: THIẾU — request Studio bắt buộc HR xác nhận cấp độ trước generate."
+            )
         if request.document_ids:
             lines.append(
                 "documentIds (Selected HR docs — ưu tiên coverage/source_files từ các doc này): "
                 + ", ".join(str(d) for d in request.document_ids[:20])
             )
+        if request.question_distribution:
+            dist_text = ", ".join(
+                f"{d.category}:{d.percentage}:{d.question_count}"
+                for d in request.question_distribution
+            )
+            lines.append(f"questionDistribution (HR canonical — ưu tiên): {dist_text}")
+        if request.focus_areas:
+            focus_text = ", ".join(
+                f"{f.name}({f.weight}%)"
+                for f in sorted(request.focus_areas, key=lambda x: (x.order_index, x.name))
+            )
+            lines.append(f"focusAreas (HR final — ưu tiên): {focus_text}")
+        if request.question_styles:
+            styles = sorted({s.strip().lower() for s in request.question_styles if s and s.strip()})
+            if styles:
+                lines.append(f"questionStyles (HR — ưu tiên): {', '.join(styles)}")
+        if request.coding_task_types:
+            coding = sorted({c.strip().upper() for c in request.coding_task_types if c and c.strip()})
+            if coding:
+                lines.append(f"codingTaskTypes (HR — ưu tiên): {', '.join(coding)}")
+
         if request.hr_note and request.hr_note.strip():
             lines.append(f"hrNote: {request.hr_note.strip()}")
-        content_mode, code_templates = _parse_content_preferences(request.hr_note)
+        if request.coding_task_types:
+            content_mode = "Mixed"
+            code_templates = [c.strip().upper() for c in request.coding_task_types if c and c.strip()]
+        else:
+            content_mode, code_templates = _parse_content_preferences(request.hr_note)
         lines.append(f"contentMode: {content_mode}")
         lines.append(f"enabledCodeTemplates: {', '.join(code_templates)}")
 
@@ -329,11 +416,15 @@ class PlanGenerationService:
                 "mỗi coverage có question_count + source_files từ context.\n"
                 if exclusive
                 else (
-                    "- coverage: 1–6 skill CHỈ từ JD text + retrieved Selected chunks "
-                    "(STRICT_CORPUS — không ép ≥4 skill JD); mỗi coverage có question_count + source_files.\n"
+                    # SCRUM-434: cover ĐỦ mọi skill HR/JD (không còn soft-cap 1–6)
+                    "- coverage: ĐỦ mọi skill trong list skills HR/JD (1 item / skill); "
+                    "question_count cộng đúng total_questions; không bỏ skill; không bịa ngoài list; "
+                    "ưu tiên source_files từ JD + HR Selected + [HỆ THỐNG] Admin khi retrieve có chunk "
+                    "(waterfall HR→SYSTEM→LLM).\n"
                     if strict
                     else (
-                        "- coverage: ít nhất 4 skill từ JD+RAG, có question_count; "
+                        "- coverage: ĐỦ mọi skill trong list skills (nếu có) hoặc skill chính từ JD+RAG; "
+                        "mỗi coverage có question_count; "
                         "mỗi coverage PHẢI có source_files = danh sách source_file thật từ context [HỆ THỐNG]/[HR] "
                         "(nếu không có chunk thì source_files=[]).\n"
                     )
@@ -362,13 +453,23 @@ class PlanGenerationService:
                     "summary/skills/coverage phải khớp instruction + corpus."
                 )
 
+        exp_level_rule = (
+            f"experience_level = {request.experience_level} (HR đã xác nhận — copy đúng, KHÔNG suy JD); "
+            if request.experience_level
+            else "experience_level = intern|junior|mid|senior|lead (legacy — suy từ hrNote/JD nếu không có experienceLevel); "
+        )
         lines.append(
             f"\nMap API (BẮT BUỘC — bạn PHẢI suy luận, không bỏ trống): "
             f"role_title từ JD+RAG; level = difficulty = {request.difficulty}; "
-            f"experience_level = intern|junior|mid|senior|lead từ JD/hrNote+RAG; "
+            f"{exp_level_rule}"
             f"total_questions = {request.number_of_questions}; "
-            f"skills = suy từ JD/hrNote/skills HR (ưu tiên HR, bổ sung từ JD nếu thiếu); "
-            f"question_type_distribution phân bổ đúng loai_cau: {types_text}; "
+            f"skills = "
+            + (
+                f"CHỈ dùng list HR sau (không thêm skill ngoài list): {skills_text}; "
+                if skills_text
+                else "suy từ JD/hrNote (HR không gửi skills); "
+            )
+            + f"question_type_distribution phân bổ đúng loai_cau: {types_text}; "
             f"summary và notes bằng {natural} giải thích lý do chọn cấp độ và phân bổ."
         )
         lines.append("\n" + format_retrieved_context(system_chunks, hr_chunks))
@@ -447,6 +548,24 @@ def _dict_to_plan(
     if not skills:
         raise ValueError("Plan skills rỗng — LLM phải liệt kê ít nhất một skill.")
 
+    # HR đã chỉnh skills trên Studio → list HR là nguồn chính (không giữ skill LLM tự thêm)
+    hr_skills = [str(s).strip() for s in (request.skills or []) if str(s).strip()]
+    if hr_skills:
+        hr_lower = {s.lower(): s for s in hr_skills}
+        filtered: list[str] = []
+        seen: set[str] = set()
+        for s in skills:
+            key = s.lower()
+            if key in hr_lower and key not in seen:
+                filtered.append(hr_lower[key])
+                seen.add(key)
+        for s in hr_skills:
+            key = s.lower()
+            if key not in seen:
+                filtered.append(s)
+                seen.add(key)
+        skills = filtered
+
     type_dist_raw = plan_data.get("question_type_distribution") or plan_data.get(
         "questionTypeDistribution", []
     )
@@ -506,6 +625,13 @@ def _dict_to_plan(
             skill=str(item.get("skill", "")),
             focusArea=str(item.get("focus_area", item.get("focusArea", ""))),
             goal=str(item.get("goal", "")),
+            answerMethod=str(
+                item.get("answer_method", item.get("answerMethod", "")) or ""
+            )
+            or None,
+            citations=parse_citations(
+                item.get("citations") or item.get("Citations") or []
+            ),
         )
         for item in outline_raw
         if isinstance(item, dict)
@@ -570,7 +696,12 @@ def _dict_to_plan(
         ]
 
     experience_raw = plan_data.get("experience_level") or plan_data.get("experienceLevel")
-    experience_level = require_experience_level_from_llm(experience_raw)
+    studio = _is_studio_plan_request(request)
+    experience_level = resolve_experience_level(
+        experience_raw,
+        hr_confirmed=request.experience_level,
+        require_hr=studio,
+    )
 
     return QuestionGenerationPlan(
         roleTitle=role_title,
@@ -628,6 +759,15 @@ def _validate_plan(plan: QuestionGenerationPlan, request: GeneratePlanRequest) -
 
     if not plan.experience_level:
         return "Plan thiếu experienceLevel."
+
+    if request.experience_level:
+        if plan.experience_level != request.experience_level:
+            return (
+                f"experienceLevel ({plan.experience_level}) không khớp "
+                f"HR đã xác nhận ({request.experience_level})."
+            )
+    elif _is_studio_plan_request(request):
+        return "Plan Studio thiếu experienceLevel HR đã xác nhận."
 
     if not plan.skills:
         return "Plan thiếu skills."
