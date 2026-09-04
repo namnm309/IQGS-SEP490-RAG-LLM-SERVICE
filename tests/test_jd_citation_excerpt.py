@@ -1,4 +1,4 @@
-"""SCRUM-394: JD primary citation excerpt phải trích từ JD (giống KB phụ)."""
+"""SCRUM-394 / SCRUM-425: JD primary citation excerpt + per-question chunk_index."""
 from __future__ import annotations
 
 from models.internal_schemas import QuestionCitationItem
@@ -8,7 +8,9 @@ from services.rag_context_helpers import (
     find_verbatim_jd_excerpt,
     make_jd_citation,
     resolve_jd_excerpt,
+    resolve_jd_excerpt_with_index,
     select_relevant_jd_excerpt,
+    select_relevant_jd_unit,
 )
 
 
@@ -86,3 +88,44 @@ def test_make_jd_citation_empty_jd() -> None:
     cit = make_jd_citation("", excerpt="x", hint="y")
     assert cit.source_file == JD_SOURCE_FILE
     assert cit.excerpt == ""
+
+
+def test_postgres_vs_redis_different_chunk_index() -> None:
+    """SCRUM-425: skill khác → chunk_index JD khác nhau."""
+    pg_ex, pg_idx = select_relevant_jd_unit(JD, "PostgreSQL EF Core database")
+    redis_ex, redis_idx = select_relevant_jd_unit(JD, "Redis caching message queues")
+    assert "PostgreSQL" in pg_ex or "EF Core" in pg_ex
+    assert "Redis" in redis_ex
+    assert pg_idx != redis_idx
+
+
+def test_llm_title_fallback_to_hint_redis() -> None:
+    """LLM copy đoạn đầu JD nhưng hint Redis → chọn unit Redis."""
+    excerpt, idx = resolve_jd_excerpt_with_index(
+        JD,
+        llm_excerpt="Senior Backend Developer",
+        hint="Redis caching message queues",
+    )
+    assert "Redis" in excerpt
+    assert idx != 0 or "Redis" in excerpt
+
+
+def test_used_indexes_diversifies_units() -> None:
+    """used_indexes tránh 2 câu lấy cùng unit khi còn unit khớp khác."""
+    used: set[int] = set()
+    c1 = ensure_jd_primary_citations(
+        [],
+        JD,
+        hint="PostgreSQL EF Core",
+        used_indexes=used,
+    )
+    c2 = ensure_jd_primary_citations(
+        [],
+        JD,
+        hint="Redis caching",
+        used_indexes=used,
+    )
+    assert c1[0].chunk_index != c2[0].chunk_index
+    assert c1[0].chunk_index in used and c2[0].chunk_index in used
+    assert "PostgreSQL" in (c1[0].excerpt or "") or "EF" in (c1[0].excerpt or "")
+    assert "Redis" in (c2[0].excerpt or "")

@@ -55,7 +55,30 @@ def _valid_questions_json(total: int = 1) -> str:
                 "focus_area": "DI",
                 "rationale": "Kiểm tra DI",
                 "sample_answer": "DI giúp tách coupling.",
-                "evaluation_criteria": ["Giải thích được DI"],
+                "evaluation_criteria": [
+                    {
+                        "id": "accuracy",
+                        "label": "Giải thích được DI",
+                        "weight": 50,
+                        "anchors": {
+                            "25": "Chưa hiểu",
+                            "50": "Nêu được DI",
+                            "75": "Có ví dụ",
+                            "100": "Edge case",
+                        },
+                    },
+                    {
+                        "id": "depth",
+                        "label": "Vận dụng thực tế",
+                        "weight": 50,
+                        "anchors": {
+                            "25": "Chung chung",
+                            "50": "Ví dụ ASP.NET",
+                            "75": "Lifetime scopes",
+                            "100": "Anti-patterns",
+                        },
+                    },
+                ],
                 "citations": [],
             }
         )
@@ -123,6 +146,14 @@ def test_generate_from_plan_success(
     assert len(result.questions) == 1
     assert result.questions[0].order == 1
     assert result.questions[0].skill == "C#"
+    crit = result.questions[0].evaluation_criteria
+    assert len(crit) >= 1
+    first = crit[0]
+    if isinstance(first, str):
+        assert first
+    else:
+        assert first.weight > 0
+        assert len(first.anchors) >= 2
 
 
 def test_generate_from_plan_falls_back_to_plan_when_no_retrieved_chunks(
@@ -171,6 +202,7 @@ def test_generate_from_plan_retry_on_invalid_json(
 def test_generate_from_plan_count_mismatch(
     settings: Settings, sample_chunk: RetrievedChunk
 ) -> None:
+    """LLM trả thừa câu → trim về totalQuestions, vẫn success."""
     service = _make_service(settings, [_valid_questions_json(2)], sample_chunk)
     request = GenerateQuestionsFromPlanRequest(
         ownerId="11111111-1111-1111-1111-111111111111",
@@ -180,6 +212,5 @@ def test_generate_from_plan_count_mismatch(
 
     result = service.generate_from_plan(request)
 
-    assert result.success is False
-    assert result.error is not None
-    assert "không khớp" in result.error.lower() or "totalQuestions" in result.error
+    assert result.success is True
+    assert len(result.questions) == 1

@@ -18,6 +18,7 @@ from models.internal_schemas import (
     GenerateQuestionsRequest,
     GenerateQuestionsResponse,
     QuestionGenerationPlan,
+    RubricCriterionItem,
 )
 from services.json_output_parser import (
     build_json_fix_prompt,
@@ -29,10 +30,13 @@ from services.rag_context_helpers import (
     enrich_citations,
     ensure_jd_primary_citations,
     format_retrieved_context,
+    is_jd_source_file,
     parse_citations,
     JD_SOURCE_FILE,
 )
 from services.rag_retrieval_service import RagRetrievalService
+from services.question_provenance_validator import apply_provenance_to_questions
+from services.rag_context_helpers import is_jd_source_file
 from vectorstores.base import RetrievedChunk
 from helpers.language_prompt import free_text_language_label, language_instruction_block
 
@@ -107,11 +111,15 @@ image_hint: KHUYẾN NGHỊ Architecture / C4 / Deployment / sơ đồ tổng qu
 }
 
 _TEMPLATE_COMMON_RULES = """QUY TẮC CHUNG (batch generate):
-- Mỗi phần tử trong questions[] gắn đúng MỘT code_template_type và tuân thủ rule của template đó.
-- Không tự đổi sang template khác cho cùng một câu; không Multiple Choice.
-- Nội dung phù hợp Programming Language (từ JD/skills), Difficulty, Skills, JD, RAG context; ví dụ sát thực tế.
+- Câu lý thuyết (Git PR, workflow, khái niệm) → answer_method=Text, KHÔNG code_snippet, KHÔNG CODE_COMPLETION.
+- Chỉ câu bài code (hoàn thiện/bug/refactor) mới gắn code_template_type + code_snippet đúng skill/focus.
+- code_snippet = ĐỀ BÀI (đoạn code ứng viên phải đọc). BẮT BUỘC với template CODE_COMPLETION/BUG_DETECTION/REFACTORING/TEST_CASE_DESIGN/PERFORMANCE_ANALYSIS — kể cả khi answer_method=Text (vd. tìm bug rồi giải thích bằng chữ).
+- KHÔNG để code lỗi/skeleton chỉ trong sample_answer mà thiếu code_snippet đề.
+- code_snippet phải cùng chủ đề câu hỏi (Git → lệnh git/bash; không dán C# OrderService vào câu Git).
+- Không Multiple Choice.
+- Nội dung phù hợp Programming Language (từ JD/skills), Difficulty, Skills, JD, RAG context.
 - Không tiết lộ đáp án trong question / code_snippet.
-- Template cần code → phải có code_snippet thật (không placeholder: "viết tại đây", "TODO only", "complete here", stub 1 dòng comment).
+- Template cần code → code_snippet thật đúng chủ đề (không placeholder, không snippet generic lệch skill).
 - image_hint chỉ gợi ý loại hình HR nên tải — tuyệt đối không sinh hình ảnh.
 - Trong JSON string: escape đúng \\\\n thành newline thật sau parse — không double-escape thành chữ \\\\n trên UI.
 - sample_answer (khi có code đáp án) BẮT BUỘC tách text/code trong GIÁ TRỊ string:
@@ -126,20 +134,22 @@ _TEMPLATE_COMMON_RULES = """QUY TẮC CHUNG (batch generate):
 
 _INTERVIEW_SYSTEM_PROMPT_BASE = """Bạn là chuyên gia thiết kế câu hỏi phỏng vấn kỹ thuật.
 
-## Mục tiêu
-Tạo bộ câu hỏi phỏng vấn. Job Description (JD) là nguồn CHÍNH; tài liệu Knowledge ([HỆ THỐNG]/[HR] chunks) chỉ là nguồn PHỤ (policy, chuẩn nội bộ, tech doc).
+## Mục tiêu — Waterfall JD → Admin → LLM
+1. **JD (HR)**: *Vì sao* có câu này — citation JD đầu tiên, excerpt nguyên văn skill/yêu cầu.
+2. **Admin ([HỆ THỐNG])**: *Kiến thức kỹ thuật chuẩn* — câu technical/problem-solving/system-design PHẢI cite chunk [HỆ THỐNG] nếu context có.
+3. **LLM**: *Bổ sung cuối* — sample_answer/rubric không map chunk → origin=LLM + reason.
 
 ## Quy tắc
-1. Bám JD trước. Không bịa yêu cầu không có trong JD. Knowledge chỉ bổ sung; không thay JD nếu mâu thuẫn.
+1. Bám JD cho lý do hỏi. Không bịa yêu cầu không có trong JD.
 2. Mỗi câu hỏi phải bám difficulty và skills được yêu cầu.
 3. Cân bằng loại câu hỏi theo question_types được yêu cầu.
 4. {language_rule}
 5. Chỉ trả về JSON hợp lệ, không markdown, không giải thích ngoài JSON.
-6. Mỗi câu hỏi BẮT BUỘC có citation JD đầu tiên: knowledge_base=\"hr\", source_file=\"{jd_source}\", chunk_index=0.
-7. SCRUM-394: excerpt JD BẮT BUỘC là trích NGUYÊN VĂN ngắn từ jobDescription (substring thật), đúng đoạn skill/yêu cầu mà câu hỏi dựa vào — GIỐNG cách citation Knowledge trích từ chunk. KHÔNG paraphrase, KHÔNG để excerpt rỗng, KHÔNG lấy đại phần đầu JD nếu không liên quan.
-8. Citation Knowledge (system/hr file) chỉ thêm SAU JD khi thật sự dùng đoạn context đó; excerpt phải là trích nguyên văn ngắn từ chunk.
-9. sample_answer ưu tiên dựa trên JD + excerpt/citations. Nếu có code: giải thích văn xuôi rồi ```lang fence``` (trong string JSON); không gộp text+code một khối; không dùng nhãn "code:".
-10. SCRUM-400: mỗi câu BẮT BUỘC có answer_method = "Text" | "Code" (Code = ứng viên nhập code; Text = trả lời văn xuôi).
+6. Mỗi câu BẮT BUỘC citation JD đầu tiên: knowledge_base=\"hr\", source_file=\"{jd_source}\", origin=\"HR\", usedFor=[\"why-asked\"]. SCRUM-425: chunk_index = đoạn JD khớp skill/yêu cầu của câu (không luôn 0); excerpt nguyên văn đoạn đó.
+7. SCRUM-394: excerpt JD BẮT BUỘC trích NGUYÊN VĂN từ jobDescription — không paraphrase, không rỗng; mỗi câu trích đoạn khác nhau nếu skill khác nhau.
+8. Citation [HỆ THỐNG] sau JD khi dùng chunk technical: origin=\"SYSTEM\", usedFor=[\"technical-body\"]; excerpt nguyên văn từ chunk.
+9. Phần sample_answer/rubric không có chunk → thêm mục origin=\"LLM\" + reason (trong citations hoặc ghi rõ trong JSON).
+10. SCRUM-400: mỗi câu BẮT BUỘC có answer_method = \"Text\" | \"Code\".
 
 ## Schema JSON bắt buộc
 {{
@@ -149,15 +159,25 @@ Tạo bộ câu hỏi phỏng vấn. Job Description (JD) là nguồn CHÍNH; t�
       "question_type": "technical|behavioral|situational|system-design|problem-solving",
       "difficulty": "easy|medium|hard",
       "rationale": "string",
-      "sample_answer": "string — giải thích văn xuôi rồi (nếu có) ```lang\\ncode\\n```; không gộp text vào fence",
-      "image_hint": "string — gợi ý HR nên tìm/đính kèm hình hoặc diagram nào (KHÔNG gen ảnh)",
+      "sample_answer": "string",
+      "image_hint": "string",
       "answer_method": "Text|Code",
       "citations": [
         {{
           "knowledge_base": "hr",
           "source_file": "{jd_source}",
+          "chunk_index": 1,
+          "excerpt": "doan trich ngan tu JD khop skill",
+          "origin": "HR",
+          "usedFor": ["why-asked"]
+        }},
+        {{
+          "knowledge_base": "system",
+          "source_file": "ten-file.pdf",
           "chunk_index": 0,
-          "excerpt": "doan trich ngan tu JD"
+          "excerpt": "doan trich tu chunk he thong",
+          "origin": "SYSTEM",
+          "usedFor": ["technical-body"]
         }}
       ]
     }}
@@ -166,31 +186,22 @@ Tạo bộ câu hỏi phỏng vấn. Job Description (JD) là nguồn CHÍNH; t�
 
 _QUESTIONS_FROM_PLAN_SYSTEM_PROMPT_BASE = """Bạn là chuyên gia sinh câu hỏi phỏng vấn (interview question generator).
 
-## Mục tiêu
-Sinh câu hỏi phỏng vấn từ APPROVED PLAN đã được HR duyệt. KHÔNG thay đổi plan.
-JD là nguồn CHÍNH; Knowledge ([HỆ THỐNG]/[HR] chunks) là nguồn PHỤ.
+## Mục tiêu — Waterfall JD → Admin → LLM
+Sinh câu hỏi từ APPROVED PLAN (KHÔNG thay đổi plan):
+1. **JD**: citation đầu — excerpt = lý do HR hỏi (skill/requirement), origin=HR, usedFor=[why-asked].
+2. **Admin [HỆ THỐNG]**: câu technical/problem-solving/code → PHẢI cite chunk [HỆ THỐNG] nếu context có; origin=SYSTEM, usedFor=[technical-body].
+3. **LLM**: sample_answer/rubric không map chunk → origin=LLM + reason. Thiếu Admin doc vẫn sinh câu (soft_llm).
 
 ## Quy tắc
-1. Tuân thủ chính xác approvedPlan: totalQuestions, questionTypeDistribution, coverage, recommendedQuestionOutline.
-2. Không sửa đổi hoặc tái lập kế hoạch — chỉ sinh câu hỏi.
-3. Chỉ trả về JSON hợp lệ, không markdown, không giải thích ngoài JSON.
-4. Trong string JSON: escape đúng chuẩn (\\\\ \\\\\\\" \\\\n). Không dùng \\s, \\a, hay backslash đơn trước chữ/số.
-5. {language_rule}
-6. [HỆ THỐNG] và [HR] là context bổ sung và có thể trống; nếu thiếu context thì vẫn sinh câu hỏi từ approvedPlan, jobDescription và hrNote.
-7. Mỗi câu BẮT BUỘC có citation JD đầu tiên: knowledge_base=\"hr\", source_file=\"{jd_source}\", chunk_index=0.
-8. SCRUM-394: excerpt JD BẮT BUỘC trích NGUYÊN VĂN từ jobDescription (substring), đúng đoạn liên quan skill/focusArea của câu — giống citation Knowledge. Không paraphrase, không rỗng.
-9. Citation Knowledge chỉ thêm sau JD khi dùng chunk retrieve; nếu không có chunk context thì chỉ citation JD.
-10. sample_answer ưu tiên dựa trên JD / approvedPlan; bổ sung từ Knowledge khi có.
-    Nếu có code đáp án: (1) 1–3 câu giải thích ngoài fence (2) rồi ```csharp|sql|python|... code ``` trong giá trị string.
-    Cấm gộp giải thích + code thành một khối; cấm nhãn "code:"; cấm copy code_snippet đề bài vào sample_answer.
-11. Thứ tự câu hỏi theo recommendedQuestionOutline nếu có.
-12. SCRUM-396: mỗi câu có code_template_type phải tuân thủ rule template (xem user prompt). Không đổi template của câu.
-13. code_snippet BẮT BUỘC (non-empty, code thật) khi code_template_type là CODE_COMPLETION|BUG_DETECTION|REFACTORING|TEST_CASE_DESIGN|PERFORMANCE_ANALYSIS.
-14. SYSTEM_DESIGN: code_snippet optional; ưu tiên image_hint kiến trúc. Cấm placeholder ("viết tại đây", "TODO only", stub 1 dòng).
-15. Escape JSON: dùng \\\\n để sau parse thành newline thật — không để chuỗi chữ \\\\n hiển thị trên UI.
-16. SCRUM-400: mỗi câu BẮT BUỘC có answer_method = "Text" | "Code".
-    - Code: ứng viên phải viết/sửa/phân tích code (CODE_COMPLETION, BUG_DETECTION, REFACTORING, TEST_CASE_DESIGN, PERFORMANCE_ANALYSIS).
-    - Text: lý thuyết, behavioral, situational, SYSTEM_DESIGN giải thích kiến trúc (không bắt nhập code).
+1. Tuân thủ approvedPlan: totalQuestions, questionTypeDistribution, coverage, recommendedQuestionOutline.
+2. Chỉ trả về JSON hợp lệ, không markdown, không giải thích ngoài JSON.
+3. {language_rule}
+4. Mỗi câu BẮT BUỘC citation JD đầu tiên (origin HR, usedFor why-asked). SCRUM-425: chunk_index = đoạn JD khớp skill/focus của câu (không luôn 0).
+5. SCRUM-394: excerpt JD trích NGUYÊN VĂN từ jobDescription — không paraphrase; mỗi câu trích đoạn khác nếu skill khác.
+6. Citation [HỆ THỐNG] sau JD khi dùng chunk; excerpt nguyên văn từ chunk.
+7. SCRUM-396/400/418: code_template, answer_method, evaluation_criteria như trước.
+8. Thiếu chunk [HỆ THỐNG]: vẫn sinh câu; gắn LLM + reason cho phần bổ sung.
+9. Nếu hrNote có STRICT_FOCUS=1: CHỈ hỏi các FOCUS_AREAS. skill/focus_area mỗi câu phải thuộc list. JD = ngữ cảnh vị trí, KHÔNG sinh câu về skill khác trong JD.
 
 ## Schema JSON bắt buộc
 {{
@@ -203,18 +214,28 @@ JD là nguồn CHÍNH; Knowledge ([HỆ THỐNG]/[HR] chunks) là nguồn PHỤ.
       "skill": "string",
       "focus_area": "string",
       "rationale": "string",
-      "sample_answer": "string — giải thích văn xuôi rồi (nếu có) ```lang\\ncode\\n```; không gộp text vào fence",
-      "evaluation_criteria": ["string"],
-      "code_template_type": "CODE_COMPLETION|BUG_DETECTION|REFACTORING|TEST_CASE_DESIGN|PERFORMANCE_ANALYSIS|SYSTEM_DESIGN",
-      "code_snippet": "string — bắt buộc với template code (không SYSTEM_DESIGN); skeleton/code thật multi-line",
-      "image_hint": "string — gợi ý HR nên tìm/đính kèm hình hoặc diagram nào (KHÔNG gen ảnh)",
+      "sample_answer": "string",
+      "evaluation_criteria": [{{ "id": "accuracy", "label": "string", "weight": 40, "anchors": {{ "25": "...", "50": "...", "75": "...", "100": "..." }} }}],
+      "code_template_type": "CODE_COMPLETION|...",
+      "code_snippet": "string",
+      "image_hint": "string",
       "answer_method": "Text|Code",
       "citations": [
         {{
           "knowledge_base": "hr",
           "source_file": "{jd_source}",
+          "chunk_index": 1,
+          "excerpt": "doan trich tu JD khop skill",
+          "origin": "HR",
+          "usedFor": ["why-asked"]
+        }},
+        {{
+          "knowledge_base": "system",
+          "source_file": "git-guide.pdf",
           "chunk_index": 0,
-          "excerpt": "doan trich ngan tu JD"
+          "excerpt": "doan trich tu chunk he thong",
+          "origin": "SYSTEM",
+          "usedFor": ["technical-body"]
         }}
       ]
     }}
@@ -416,6 +437,147 @@ def _default_snippet_for_template(template_id: str) -> str:
     return samples.get(template_id, "")
 
 
+_GENERIC_FALLBACK_MARKERS = (
+    "IOrderRepository",
+    "GetCustomerOrderTotalAsync",
+    "class OrderService",
+)
+_CODING_TASK_HINTS = (
+    "hoàn thiện",
+    "complete the",
+    "điền vào",
+    "tìm bug",
+    "tìm lỗi",
+    "lỗi logic",
+    "fix the bug",
+    "phân tích đoạn code",
+    "đoạn code sau",
+    "bug detection",
+    "refactor",
+    "viết hàm",
+    "write a function",
+    "debug this",
+)
+_GIT_TOPIC_HINTS = (
+    "git",
+    "pull request",
+    "branching",
+    "rebase",
+    "merge request",
+    "commit",
+    "gitignore",
+)
+
+
+def _question_topic(q: GeneratedQuestionItem) -> str:
+    return " ".join(
+        str(x or "") for x in (q.question, q.skill, q.focus_area, q.rationale)
+    ).lower()
+
+
+def _is_generic_fallback_snippet(snippet: str | None) -> bool:
+    text = snippet or ""
+    return any(m in text for m in _GENERIC_FALLBACK_MARKERS)
+
+
+def _is_coding_exercise(q: GeneratedQuestionItem) -> bool:
+    blob = _question_topic(q)
+    return any(h in blob for h in _CODING_TASK_HINTS)
+
+
+def _snippet_matches_topic(q: GeneratedQuestionItem) -> bool:
+    snippet = q.code_snippet or ""
+    if not snippet.strip():
+        return True
+    if _is_generic_fallback_snippet(snippet):
+        return False
+    topic = _question_topic(q)
+    if any(k in topic for k in _GIT_TOPIC_HINTS):
+        low = snippet.lower()
+        return any(
+            k in low
+            for k in ("git ", "git\n", "merge", "rebase", "branch", "commit", "pull request", ".gitignore")
+        )
+    return True
+
+
+def _clear_code_fields(q: GeneratedQuestionItem) -> None:
+    q.code_template_type = None
+    q.code_snippet = None
+    q.answer_method = "Text"
+
+
+def _template_requires_snippet(template_id: str | None) -> bool:
+    return (template_id or "").strip().upper() in _TEMPLATES_REQUIRING_SNIPPET
+
+
+def _ensure_code_heavy_has_snippet(q: GeneratedQuestionItem) -> None:
+    """Template code-heavy bắt buộc có code_snippet đề — inject default nếu thiếu."""
+    tpl = (q.code_template_type or "").strip().upper()
+    if not _template_requires_snippet(tpl):
+        return
+    if (q.code_snippet or "").strip():
+        return
+    logger.warning(
+        "Thiếu code_snippet đề cho template=%s — inject default stem",
+        tpl,
+    )
+    q.code_snippet = _default_snippet_for_template(tpl) or None
+
+
+def _apply_outline_answer_method(q: GeneratedQuestionItem, preferred: str | None) -> None:
+    """Outline HR: set answerMethod; Text không xóa đề nếu template code-heavy / đã có stem."""
+    if not preferred:
+        return
+    q.answer_method = preferred
+    if preferred == "Text":
+        tpl = (q.code_template_type or "").strip().upper()
+        has_stem = bool((q.code_snippet or "").strip())
+        if not _template_requires_snippet(tpl) and not has_stem:
+            q.code_snippet = None
+            q.code_template_type = None
+    elif preferred == "Code" and not (q.code_template_type or "").strip():
+        pass
+
+
+def _align_code_to_question(q: GeneratedQuestionItem, content_mode: str) -> None:
+    """Câu Git/lý thuyết không được dán snippet C# generic (OrderService).
+
+    Template code-heavy: giữ đề (code_snippet); Answer Text vẫn có thể có snippet.
+    """
+    if content_mode == "TheoryOnly":
+        _clear_code_fields(q)
+        return
+
+    tpl = (q.code_template_type or "").strip().upper()
+    requires = _template_requires_snippet(tpl)
+
+    # Snippet generic / lệch chủ đề
+    if q.code_snippet and not _snippet_matches_topic(q):
+        if requires and _is_coding_exercise(q):
+            # Bài code thật nhưng snippet fallback lệch → thay default, giữ template
+            q.code_snippet = _default_snippet_for_template(tpl) or None
+            return
+        _clear_code_fields(q)
+        return
+
+    # Mixed + câu lý thuyết (không phải coding) + không phải template bắt buộc snippet
+    if content_mode == "Mixed" and not _is_coding_exercise(q) and not requires:
+        _clear_code_fields(q)
+        return
+
+    # Sai gắn template code-heavy lên câu lý thuyết không có snippet khớp → bỏ template
+    if content_mode == "Mixed" and not _is_coding_exercise(q) and requires:
+        if not (q.code_snippet or "").strip():
+            _clear_code_fields(q)
+        else:
+            _ensure_code_heavy_has_snippet(q)
+        return
+
+    if requires:
+        _ensure_code_heavy_has_snippet(q)
+
+
 def _default_image_hint(template_id: str | None, question_type: str | None = None) -> str:
     """Gợi ý text cho HR — không AI gen ảnh."""
     tpl = (template_id or "").upper()
@@ -459,9 +621,96 @@ def _infer_answer_method(template_id: str | None, snippet: str | None) -> str:
     return "Text"
 
 
+def _parse_evaluation_criteria(raw: object) -> list[RubricCriterionItem | str]:
+    """SCRUM-418: parse criteria object hoặc legacy string."""
+    if not isinstance(raw, list):
+        return []
+    out: list[RubricCriterionItem | str] = []
+    for item in raw:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                out.append(text)
+            continue
+        if isinstance(item, dict):
+            try:
+                crit = RubricCriterionItem.model_validate(item)
+                if crit.label.strip():
+                    out.append(crit)
+            except Exception:
+                label = str(item.get("label") or item.get("text") or "").strip()
+                if label:
+                    out.append(label)
+    return out
+
+
 # Sinh batch để tránh timeout + JSON quá dài khi totalQuestions lớn (vd 30).
 _QUESTION_BATCH_SIZE = 10
 _BATCH_THRESHOLD = 12
+
+_TECHNICAL_KEYWORDS = frozenset(
+    {
+        "git",
+        "docker",
+        "kubernetes",
+        "sql",
+        "api",
+        "rest",
+        "csharp",
+        "python",
+        "javascript",
+        "react",
+        "database",
+        "algorithm",
+        "microservice",
+    }
+)
+
+
+def _build_plan_retrieve_query(
+    plan: QuestionGenerationPlan, hr_note: str | None
+) -> str:
+    """SCRUM-421: embed skill/focus từ plan — không chỉ JD."""
+    parts: list[str] = []
+    for cov in plan.coverage[:10]:
+        if cov.skill:
+            parts.append(cov.skill.strip())
+        for fa in (cov.focus_areas or [])[:4]:
+            if fa:
+                parts.append(str(fa).strip())
+    for item in plan.recommended_question_outline[:15]:
+        if item.skill:
+            parts.append(item.skill.strip())
+        if item.focus_area:
+            parts.append(item.focus_area.strip())
+    if hr_note and hr_note.strip():
+        parts.append(hr_note.strip()[:500])
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for p in parts:
+        key = p.lower()
+        if p and key not in seen:
+            seen.add(key)
+            ordered.append(p)
+    return " | ".join(ordered)
+
+
+def _plan_needs_more_system_chunks(plan: QuestionGenerationPlan) -> bool:
+    query = _build_plan_retrieve_query(plan, None).lower()
+    if any(kw in query for kw in _TECHNICAL_KEYWORDS):
+        return True
+    for cov in plan.coverage:
+        for sf in cov.source_files or []:
+            if sf and not is_jd_source_file(str(sf)):
+                return True
+    return False
+
+
+def _build_skills_retrieve_query(request: GenerateQuestionsRequest) -> str | None:
+    parts = [s.strip() for s in (request.skills or []) if s.strip()]
+    if request.hr_note and request.hr_note.strip():
+        parts.append(request.hr_note.strip()[:500])
+    return " | ".join(parts) if parts else None
 
 
 class QuestionGenerationService:
@@ -476,6 +725,58 @@ class QuestionGenerationService:
         self._settings = settings
         self._debug = settings.debug
 
+    def _merge_system_chunks_by_skills(
+        self,
+        base: list[RetrievedChunk],
+        plan: QuestionGenerationPlan,
+    ) -> list[RetrievedChunk]:
+        """Retrieve thêm theo skill unique — merge/dedupe để pool đa dạng hơn."""
+        skills: list[str] = []
+        seen: set[str] = set()
+        for cov in plan.coverage or []:
+            s = (cov.skill or "").strip()
+            key = s.lower()
+            if s and key not in seen:
+                seen.add(key)
+                skills.append(s)
+        for item in plan.recommended_question_outline or []:
+            s = (item.skill or item.focus_area or "").strip()
+            key = s.lower()
+            if s and key not in seen:
+                seen.add(key)
+                skills.append(s)
+        if not skills:
+            return base
+
+        merged = list(base)
+        keys = {
+            (
+                (c.metadata or {}).get("fileName", c.document_id),
+                int(c.chunk_index or 0),
+            )
+            for c in merged
+        }
+        for skill in skills[:8]:
+            try:
+                extra = self._retrieval.retrieve_system_only(
+                    skill,
+                    top_k_system=3,
+                    query_extra=skill,
+                )
+            except Exception:
+                logger.warning("per-skill retrieve failed for %s", skill, exc_info=True)
+                continue
+            for c in extra:
+                key = (
+                    (c.metadata or {}).get("fileName", c.document_id),
+                    int(c.chunk_index or 0),
+                )
+                if key in keys:
+                    continue
+                keys.add(key)
+                merged.append(c)
+        return merged
+
     def generate(self, request: GenerateQuestionsRequest) -> GenerateQuestionsResponse:
         start = time.time()
 
@@ -488,9 +789,16 @@ class QuestionGenerationService:
             )
 
         try:
+            query_extra = _build_skills_retrieve_query(request)
+            top_k_system = self._settings.top_k_system
+            if query_extra:
+                top_k_system = max(top_k_system, 8)
             system_chunks, hr_chunks = self._retrieval.retrieve_for_job(
                 request.job_description,
                 request.owner_id.strip(),
+                query_extra=query_extra,
+                document_ids=request.document_ids or None,
+                top_k_system=top_k_system,
             )
         except Exception as exc:
             logger.exception("Retrieval failed")
@@ -537,6 +845,12 @@ class QuestionGenerationService:
                 ),
             )
 
+        questions = apply_provenance_to_questions(
+            questions,
+            chunks=all_chunks,
+            job_description=request.job_description,
+        )
+
         return GenerateQuestionsResponse(
             success=parse_error is None and len(questions) > 0,
             questions=questions,
@@ -567,9 +881,23 @@ class QuestionGenerationService:
             )
 
         try:
+            query_extra = _build_plan_retrieve_query(
+                request.approved_plan, request.hr_note
+            )
+            top_k_system = self._settings.top_k_system
+            if _plan_needs_more_system_chunks(request.approved_plan):
+                top_k_system = max(top_k_system, 8)
+            doc_ids = request.document_ids or None
             system_chunks, hr_chunks = self._retrieval.retrieve_for_job(
                 request.job_description,
                 request.owner_id.strip(),
+                query_extra=query_extra or None,
+                top_k_system=top_k_system,
+                document_ids=doc_ids if doc_ids else None,
+            )
+            # Multi-skill: bổ sung chunk System theo từng skill để tránh mọi câu dính 1 chunk
+            system_chunks = self._merge_system_chunks_by_skills(
+                system_chunks, request.approved_plan
             )
         except Exception as exc:
             logger.exception("Retrieval failed")
@@ -596,6 +924,12 @@ class QuestionGenerationService:
             questions, parse_error = self._generate_from_plan_single(
                 request, system_chunks, hr_chunks, all_chunks
             )
+
+        questions = apply_provenance_to_questions(
+            questions,
+            chunks=all_chunks,
+            job_description=request.job_description,
+        )
 
         return GenerateQuestionsFromPlanResponse(
             success=parse_error is None and len(questions) > 0,
@@ -806,12 +1140,10 @@ class QuestionGenerationService:
             lines.append(_format_enabled_template_rules(templates))
 
         lines.append(
-            "\nHướng dẫn (SCRUM-392/394): JD là nguồn CHÍNH — mỗi câu BẮT BUỘC có citation "
-            f'source_file="{JD_SOURCE_FILE}" (knowledge_base=hr, chunk_index=0) đứng đầu. '
-            "excerpt JD phải là đoạn NGUYÊN VĂN copy từ jobDescription ở trên (substring), "
-            "chỉ rõ phần JD mà câu hỏi dựa vào — giống excerpt của citation Knowledge. "
-            "Knowledge chunks chỉ là PHỤ — citation file KB thêm sau JD khi thật sự dùng đoạn đó. "
-            "Citation chunk phải khớp source_file/chunk_index trong context bên dưới."
+            "\nHướng dẫn (SCRUM-421 waterfall): JD = vì sao hỏi (citation HR đầu, usedFor why-asked). "
+            f'Admin [HỆ THỐNG] = kiến thức kỹ thuật (origin SYSTEM, usedFor technical-body) khi có chunk. '
+            "LLM = sample_answer/rubric không map chunk (origin LLM + reason). "
+            f'Citation JD: source_file="{JD_SOURCE_FILE}", excerpt nguyên văn đoạn khớp skill (SCRUM-425 chunk_index theo đoạn, không luôn 0).'
         )
         lines.append("\n" + format_retrieved_context(system_chunks, hr_chunks))
         lines.append(
@@ -840,6 +1172,18 @@ class QuestionGenerationService:
         ]
         if request.hr_note and request.hr_note.strip():
             lines.append(f"hrNote: {request.hr_note.strip()}")
+            if "STRICT_FOCUS=1" in request.hr_note:
+                lines.append(
+                    "STRICT_FOCUS: Chỉ sinh câu hỏi bám coverage/outline/FOCUS_AREAS. "
+                    "Không hỏi skill khác dù JD còn đề cập. JD chỉ dùng cho citation why-asked."
+                )
+            # SCRUM-429: Studio regen — tránh trùng câu khác trong cùng plan
+            if "STUDIO_REGEN=1" in request.hr_note or "AVOID_QUESTIONS=" in request.hr_note:
+                lines.append(
+                    "STUDIO_REGEN / AVOID_QUESTIONS: Câu mới PHẢI khác ý và cấu trúc các mục "
+                    "trong AVOID_QUESTIONS (phân tách |#|). Không paraphrase gần như giống; "
+                    "đổi góc hỏi / ví dụ / yêu cầu cụ thể trong khi vẫn bám skill/focus/goal của outline."
+                )
         mode, templates = _parse_content_preferences(request.hr_note)
         lines.append(f"contentMode: {mode}")
         lines.append(f"enabledCodeTemplates: {', '.join(templates)}")
@@ -848,7 +1192,7 @@ class QuestionGenerationService:
             "Nếu mode=CodeOnly: mỗi câu cần code_template_type hợp lệ trong enabledCodeTemplates; "
             "template code bắt buộc có code_snippet thật (không placeholder)."
         )
-        lines.append("Nếu mode=Mixed: trộn câu lý thuyết và câu code, cân bằng theo enabledCodeTemplates.")
+        lines.append("Nếu mode=Mixed: câu lý thuyết (Git/PR/khái niệm) = Text, không snippet; chỉ câu bài code mới có code_snippet đúng skill.")
         lines.append(
             "Mỗi câu BẮT BUỘC có image_hint (1–2 câu): gợi ý HR nên tìm/đính kèm hình hoặc diagram nào. "
             "KHÔNG yêu cầu AI gen ảnh; chỉ text gợi ý."
@@ -865,12 +1209,14 @@ class QuestionGenerationService:
             "[APPROVED PLAN — KHÔNG ĐƯỢC THAY ĐỔI]",
             json.dumps(plan_json, ensure_ascii=False, indent=2),
             "",
-            "Hướng dẫn (SCRUM-392/394): JD là nguồn CHÍNH — mỗi câu BẮT BUỘC citation "
-            f'source_file="{JD_SOURCE_FILE}" đứng đầu. '
-            "excerpt JD = trích nguyên văn từ jobDescription (substring liên quan skill/focus). "
-            "Knowledge chỉ PHỤ — thêm citation chunk sau JD khi dùng context; "
-            "nếu không có chunk thì chỉ citation JD. "
-            "Citation chunk phải khớp source_file/chunk_index.",
+            "Hướng dẫn (SCRUM-421 waterfall + SCRUM-426): JD = why-asked (citation HR đầu). "
+            "Admin [HỆ THỐNG] = technical-body khi có chunk. "
+            "LLM = phần bổ sung không map chunk (origin + reason). "
+            f'JD citation: source_file="{JD_SOURCE_FILE}", excerpt nguyên văn đoạn khớp skill/focus. '
+            "Nếu approvedPlan.recommendedQuestionOutline[i].citations đã khóa — "
+            "BẮT BUỘC bám skill/focus/goal của slot đó; không đổi why-asked JD chunk đã khóa. "
+            "rationale PHẢI trùng outline[i].goal (đã khóa ở Live Preview) — không viết lại lý do khác. "
+            "Citation chunk phải khớp source_file/chunk_index trong context.",
             "Không chèn backslash lạ trong string (dùng \\\\ nếu cần ký tự \\).",
             f"Toàn bộ content câu hỏi/rationale/sample_answer/evaluation_criteria bằng "
             f"{free_text_language_label(request.language)}.",
@@ -916,18 +1262,12 @@ class QuestionGenerationService:
             citations = enrich_citations(
                 parse_citations(item.get("citations", [])), chunk_lookup
             )
-            # SCRUM-392/394: JD đứng đầu + excerpt nguyên văn / liên quan câu hỏi
+            # SCRUM-425: ensure_jd_primary sau khi có skill/focus (xem _assign_jd_primary_citations)
             rationale = str(item.get("rationale", ""))
-            skill_val = str(item.get("skill") or "").strip()
+            skill_val = str(item.get("skill") or "").strip() or None
             focus_val = str(
                 item.get("focus_area") or item.get("focusArea") or ""
-            ).strip()
-            jd_hint = " ".join(
-                part for part in [q_text, skill_val, focus_val, rationale] if part
-            )
-            citations = ensure_jd_primary_citations(
-                citations, job_description, hint=jd_hint
-            )
+            ).strip() or None
 
             questions.append(
                 GeneratedQuestionItem(
@@ -941,6 +1281,8 @@ class QuestionGenerationService:
                         item.get("sample_answer", item.get("sampleAnswer", ""))
                     ).strip(),
                     citations=citations,
+                    skill=skill_val,
+                    focus_area=focus_val,
                     code_template_type=str(item.get("code_template_type", item.get("codeTemplateType", ""))).strip() or None,
                     code_snippet=str(item.get("code_snippet", item.get("codeSnippet", ""))).strip() or None,
                     image_hint=str(item.get("image_hint", item.get("imageHint", ""))).strip() or None,
@@ -959,30 +1301,31 @@ class QuestionGenerationService:
                 q.code_snippet = None
                 q.answer_method = "Text"
             else:
-                if q.code_template_type not in enabled_templates:
-                    q.code_template_type = enabled_templates[idx % len(enabled_templates)]
+                llm_template = (q.code_template_type or "").strip().upper() or None
+                q.code_template_type = llm_template
+                if content_mode == "CodeOnly":
+                    if q.code_template_type not in enabled_templates:
+                        q.code_template_type = enabled_templates[idx % len(enabled_templates)]
+                elif q.code_template_type and q.code_template_type not in enabled_templates:
+                    q.code_template_type = None
 
-                # Unescape \\n + bỏ placeholder stub từ LLM
                 q.code_snippet = _harden_code_snippet(q.code_snippet, q.code_template_type)
 
-                needs_snippet = (q.code_template_type or "") in _TEMPLATES_REQUIRING_SNIPPET
+                needs_snippet = _template_requires_snippet(q.code_template_type)
+                # Mixed + CodeOnly: template code-heavy thiếu đề → fallback default stem
                 if needs_snippet and not q.code_snippet:
-                    # CodeOnly luôn fallback; Mixed cũng fallback nếu template bắt buộc snippet
-                    if content_mode == "CodeOnly" or needs_snippet:
-                        q.code_snippet = _default_snippet_for_template(q.code_template_type or "") or None
+                    q.code_snippet = _default_snippet_for_template(q.code_template_type or "") or None
 
-                # SYSTEM_DESIGN: snippet optional — clear nếu chỉ là placeholder đã harden thành None
                 if q.code_template_type == "SYSTEM_DESIGN" and not (q.code_snippet or "").strip():
                     q.code_snippet = None
 
-                # SCRUM-400: harden answer_method theo mode + template
                 if content_mode == "CodeOnly":
                     q.answer_method = "Code"
                 elif not q.answer_method:
                     q.answer_method = _infer_answer_method(q.code_template_type, q.code_snippet)
-                elif q.answer_method == "Text" and needs_snippet and (q.code_snippet or "").strip():
-                    # Template code bắt buộc snippet → Candidate cần ô code
-                    q.answer_method = "Code"
+
+            _align_code_to_question(q, content_mode)
+            _ensure_code_heavy_has_snippet(q)
 
             # Mọi mode: luôn có image_hint gợi ý cho HR
             if not (q.image_hint or "").strip():
@@ -990,7 +1333,113 @@ class QuestionGenerationService:
 
             if not q.answer_method:
                 q.answer_method = _infer_answer_method(q.code_template_type, q.code_snippet)
+
+        # SCRUM-425: gán JD chunk theo skill sau khi parse (luồng không plan)
+        if job_description:
+            self._assign_jd_primary_citations(questions, job_description)
         return questions, None
+
+    @staticmethod
+    def _has_locked_jd_citation(citations: list) -> bool:
+        for c in citations or []:
+            if is_jd_source_file(getattr(c, "source_file", None)) and (
+                getattr(c, "excerpt", None) or ""
+            ).strip():
+                return True
+        return False
+
+    @staticmethod
+    def _assign_jd_primary_citations(
+        questions: list[GeneratedQuestionItem],
+        job_description: str,
+        *,
+        skip_locked: bool = False,
+    ) -> None:
+        """SCRUM-425/426: chọn unit JD theo skill; skip câu đã khóa từ outline."""
+        used_indexes: set[int] = set()
+        for q in questions:
+            if skip_locked and QuestionGenerationService._has_locked_jd_citation(
+                q.citations
+            ):
+                for c in q.citations or []:
+                    if is_jd_source_file(c.source_file) and c.chunk_index is not None:
+                        used_indexes.add(int(c.chunk_index))
+                continue
+            jd_hint = " ".join(
+                part
+                for part in [
+                    q.question or "",
+                    q.skill or "",
+                    q.focus_area or "",
+                    q.rationale or "",
+                ]
+                if part
+            )
+            q.citations = ensure_jd_primary_citations(
+                list(q.citations or []),
+                job_description,
+                hint=jd_hint,
+                used_indexes=used_indexes,
+            )
+
+    @staticmethod
+    def _seed_rationale_from_outline(
+        questions: list[GeneratedQuestionItem],
+        approved_plan: QuestionGenerationPlan,
+    ) -> None:
+        """SCRUM-427: rationale = outline.goal đã khóa (ghi đè LLM)."""
+        outline_by_order = {
+            o.order: o for o in (approved_plan.recommended_question_outline or [])
+        }
+        for idx, q in enumerate(questions):
+            outline = None
+            if q.order is not None and q.order in outline_by_order:
+                outline = outline_by_order[q.order]
+            elif idx < len(approved_plan.recommended_question_outline or []):
+                outline = approved_plan.recommended_question_outline[idx]
+            if outline is None:
+                continue
+            goal = (outline.goal or "").strip()
+            if goal:
+                q.rationale = goal
+
+    @staticmethod
+    def _seed_citations_from_outline(
+        questions: list[GeneratedQuestionItem],
+        approved_plan: QuestionGenerationPlan,
+    ) -> None:
+        """SCRUM-426: copy citations đã khóa trên outline slot vào câu hỏi."""
+        outline_by_order = {
+            o.order: o for o in (approved_plan.recommended_question_outline or [])
+        }
+        for idx, q in enumerate(questions):
+            outline = None
+            if q.order is not None and q.order in outline_by_order:
+                outline = outline_by_order[q.order]
+            elif idx < len(approved_plan.recommended_question_outline or []):
+                outline = approved_plan.recommended_question_outline[idx]
+            if outline is None or not outline.citations:
+                continue
+            slot_cits = list(outline.citations)
+            has_slot_system = any(
+                (c.origin or "").upper() == "SYSTEM"
+                or (
+                    (c.knowledge_base or "").lower() == "system"
+                    and not is_jd_source_file(c.source_file)
+                )
+                for c in slot_cits
+            )
+            extras = []
+            for c in q.citations or []:
+                if is_jd_source_file(c.source_file):
+                    continue
+                if has_slot_system and (
+                    (c.origin or "").upper() == "SYSTEM"
+                    or (c.knowledge_base or "").lower() == "system"
+                ):
+                    continue
+                extras.append(c)
+            q.citations = slot_cits + extras
 
     def _parse_questions_from_plan(
         self,
@@ -1033,7 +1482,7 @@ class QuestionGenerationService:
                         "evaluation_criteria", item.get("evaluationCriteria", [])
                     )
                     if isinstance(eval_raw, list):
-                        q.evaluation_criteria = [str(x) for x in eval_raw]
+                        q.evaluation_criteria = _parse_evaluation_criteria(eval_raw)
                     tpl_val = item.get("code_template_type", item.get("codeTemplateType"))
                     if tpl_val:
                         q.code_template_type = str(tpl_val).strip()
@@ -1044,27 +1493,44 @@ class QuestionGenerationService:
                     if hint_val:
                         q.image_hint = str(hint_val).strip()
 
-        # Gán order từ outline nếu LLM thiếu
+        # Gán order / skill / focus / answerMethod từ outline nếu LLM thiếu
         if approved_plan.recommended_question_outline:
             outline_by_order = {
                 o.order: o for o in approved_plan.recommended_question_outline
             }
             for idx, q in enumerate(questions):
+                outline = None
                 if q.order is None and idx < len(
                     approved_plan.recommended_question_outline
                 ):
                     outline = approved_plan.recommended_question_outline[idx]
                     q.order = outline.order
-                    if not q.skill:
-                        q.skill = outline.skill
-                    if not q.focus_area:
-                        q.focus_area = outline.focus_area
                 elif q.order is not None and q.order in outline_by_order:
                     outline = outline_by_order[q.order]
-                    if not q.skill:
-                        q.skill = outline.skill
-                    if not q.focus_area:
-                        q.focus_area = outline.focus_area
+                if outline is None:
+                    continue
+                if not q.skill:
+                    q.skill = outline.skill
+                if not q.focus_area:
+                    q.focus_area = outline.focus_area
+                # HR preview: ưu tiên answerMethod trên outline.
+                # Text = cách trả lời — KHÔNG xóa code_snippet đề nếu template code-heavy.
+                preferred = _normalize_answer_method(
+                    getattr(outline, "answer_method", None)
+                )
+                _apply_outline_answer_method(q, preferred)
+
+        # SCRUM-427: rationale khóa = outline.goal
+        self._seed_rationale_from_outline(questions, approved_plan)
+
+        # SCRUM-426: copy citations đã khóa từ outline → câu hỏi
+        self._seed_citations_from_outline(questions, approved_plan)
+
+        # SCRUM-425/426: chỉ gán JD cho câu chưa có lock từ slot
+        if job_description:
+            self._assign_jd_primary_citations(
+                questions, job_description, skip_locked=True
+            )
 
         validation_error = _validate_questions_against_plan(
             questions,
@@ -1072,6 +1538,10 @@ class QuestionGenerationService:
             expected_count=expected_count,
             strict_count=expected_count is None,
         )
+        mode, _ = _parse_content_preferences(hr_note)
+        for q in questions:
+            _align_code_to_question(q, mode)
+            _ensure_code_heavy_has_snippet(q)
         return questions, validation_error
 
 
