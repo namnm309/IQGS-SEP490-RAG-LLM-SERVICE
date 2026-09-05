@@ -60,6 +60,39 @@ def test_retrieve_for_job_passes_document_ids_and_query_extra():
     ) or hr_call.kwargs.get("document_ids") == ["hr-doc-1", "hr-doc-2"]
 
 
+def test_retrieve_for_job_empty_document_ids_skips_hr():
+    """SCRUM-443: không tick file = không retrieve HR."""
+    store = MagicMock()
+    embedding = MagicMock()
+    embedding.embed_query.return_value = [0.1, 0.2, 0.3]
+    settings = MagicMock()
+    settings.top_k_system = 3
+    settings.top_k_hr = 5
+
+    sys_chunk = RetrievedChunk(
+        document_id="sys-1",
+        chunk_index=0,
+        content="sys",
+        scope="SYSTEM",
+        owner_id=None,
+        score=0.9,
+        metadata={},
+    )
+    store.similarity_search.return_value = [sys_chunk]
+
+    svc = RagRetrievalService(store, embedding, settings)
+    system, hr = svc.retrieve_for_job(
+        "Backend engineer JD",
+        "owner-1",
+        document_ids=[],
+    )
+
+    assert system == [sys_chunk]
+    assert hr == []
+    assert store.similarity_search.call_count == 1
+    assert store.similarity_search.call_args.kwargs.get("scope") == "SYSTEM"
+
+
 def test_generate_plan_request_accepts_document_ids():
     from models.internal_schemas import GeneratePlanRequest
 

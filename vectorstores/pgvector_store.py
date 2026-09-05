@@ -167,7 +167,8 @@ class PgVectorStore:
         if scope_upper == "HR" and not owner_id:
             raise ValueError("HR search bắt buộc owner_id")
 
-        # SCRUM-388: filter HR theo document_id Selected (SYSTEM không filter)
+        # SCRUM-443: HR chỉ retrieve khi có document_ids Selected.
+        # document_ids rỗng/null → không lấy chunk HR (tránh fallback toàn thư viện).
         doc_ids = [d.strip() for d in (document_ids or []) if d and str(d).strip()]
         use_doc_filter = scope_upper == "HR" and len(doc_ids) > 0
 
@@ -205,21 +206,8 @@ class PgVectorStore:
             """
             params = [query_embedding, owner_id, doc_ids, query_embedding, top_k]
         else:
-            sql = """
-                SELECT
-                    document_id,
-                    chunk_index,
-                    content,
-                    scope,
-                    owner_id,
-                    metadata,
-                    1 - (embedding <=> %s::vector) AS score
-                FROM tbl_knowledge_chunks
-                WHERE scope = 'HR' AND owner_id = %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """
-            params = [query_embedding, owner_id, query_embedding, top_k]
+            # SCRUM-443: không tick file = không dùng kho HR
+            return []
 
         results: list[RetrievedChunk] = []
         with self._pool.connection() as conn:
@@ -237,7 +225,7 @@ class PgVectorStore:
                             content=row["content"],
                             scope=row["scope"],
                             owner_id=str(row["owner_id"]) if row["owner_id"] else None,
-                            score=float(row["score"]),
+                            score=float(row["score"]) if row.get("score") is not None else 0.0,
                             metadata=metadata or {},
                         )
                     )

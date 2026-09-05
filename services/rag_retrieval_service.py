@@ -45,12 +45,17 @@ class RagRetrievalService:
             top_k=top_k_system or self._settings.top_k_system,
             document_ids=None,
         )
+        # SCRUM-443: không có document_ids Selected → bỏ qua HR retrieve
+        doc_ids = [d.strip() for d in (document_ids or []) if d and str(d).strip()]
+        if not doc_ids:
+            return system_chunks, []
+
         hr_chunks = self._store.similarity_search(
             query_embedding,
             scope="HR",
             owner_id=owner_id,
             top_k=top_k_hr or self._settings.top_k_hr,
-            document_ids=document_ids,
+            document_ids=doc_ids,
         )
         return system_chunks, hr_chunks
 
