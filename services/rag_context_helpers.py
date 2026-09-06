@@ -121,17 +121,33 @@ def find_verbatim_jd_excerpt(jd_text: str, candidate: str) -> str | None:
 
 
 def _split_jd_units(jd_text: str) -> list[str]:
-    """Tách JD thành đoạn/câu để chọn excerpt liên quan câu hỏi."""
+    """Tách JD thành đoạn/câu/bullet để chọn excerpt liên quan câu hỏi."""
     text = (jd_text or "").strip()
     if not text:
         return []
 
     parts = re.split(r"\n\s*\n+", text)
     units: list[str] = []
+    bullet_re = re.compile(r"^(\s*[-*•]|\s*\d+[.)])\s+")
+
     for part in parts:
         part = part.strip()
         if not part:
             continue
+        lines = [ln.strip() for ln in part.split("\n") if ln.strip()]
+        # SCRUM-425: mỗi bullet = 1 unit (PostgreSQL vs Redis không còn chung 1 đoạn)
+        bullet_lines = [ln for ln in lines if bullet_re.match(ln)]
+        if len(bullet_lines) >= 2:
+            header = ""
+            for ln in lines:
+                if bullet_re.match(ln):
+                    # Giữ header section ngắn kèm bullet nếu có (vd. Requirements:)
+                    item = f"{header} {ln}".strip() if header and len(header) <= 40 else ln
+                    units.append(item)
+                elif not bullet_lines or ln == lines[0]:
+                    header = ln
+            continue
+
         if len(part) <= EXCERPT_FALLBACK_LEN:
             units.append(part)
             continue
@@ -166,37 +182,144 @@ def _split_jd_units(jd_text: str) -> list[str]:
     return units
 
 
+def match_jd_unit_index(units: list[str], excerpt: str) -> int | None:
+    """Map excerpt về index unit JD (dùng chung generation + JD-fit)."""
+    text = (excerpt or "").strip()
+    if not units:
+        return None
+    if not text:
+        return 0
+    for i, unit in enumerate(units):
+        if text in unit or unit in text:
+            return i
+    needle = text[:40].lower()
+    for i, unit in enumerate(units):
+        if needle and needle in unit.lower():
+            return i
+    return 0
+
+
+def _unit_rank_score(unit: str, hint_tokens: set[str]) -> float:
+    unit_tokens = set(_tokenize(unit))
+    if not unit_tokens or not hint_tokens:
+        return 0.0
+    overlap = hint_tokens & unit_tokens
+    score = len(overlap)
+    if score <= 0:
+        return 0.0
+    density = score / max(1, len(unit_tokens))
+    return score * 10 + density
+
+
+def select_relevant_jd_unit(
+    jd_text: str,
+    hint: str | None = None,
+    *,
+    used_indexes: set[int] | None = None,
+) -> tuple[str, int]:
+    """
+    SCRUM-425: chọn (excerpt, chunk_index) theo hint; phạt unit đã dùng để đa dạng hóa.
+    Fallback: unit 0 / đầu JD.
+    """
+    jd = (jd_text or "").strip()
+    if not jd:
+        return "", JD_CHUNK_INDEX
+
+    units = _split_jd_units(jd)
+    if not units:
+        return fallback_excerpt(jd), JD_CHUNK_INDEX
+
+    hint_tokens = set(_tokenize(hint or ""))
+    used = used_indexes or set()
+
+    if not hint_tokens:
+        # Không hint → ưu tiên unit chưa dùng, rồi unit 0
+        for i, unit in enumerate(units):
+            if i not in used:
+                return _clip_excerpt(unit, JD_EXCERPT_TARGET_LEN), i
+        return _clip_excerpt(units[0], JD_EXCERPT_TARGET_LEN), 0
+
+    best_idx = -1
+    best_score = 0.0
+    for i, unit in enumerate(units):
+        ranked = _unit_rank_score(unit, hint_tokens)
+        if ranked <= 0:
+            continue
+        # Phạt unit đã dùng (cùng pattern SYSTEM used_keys)
+        if i in used:
+            ranked -= 30.0
+        if ranked > best_score:
+            best_score = ranked
+            best_idx = i
+
+    if best_idx < 0 or best_score <= 0:
+        for i, unit in enumerate(units):
+            if i not in used:
+                return _clip_excerpt(unit, JD_EXCERPT_TARGET_LEN), i
+        return _clip_excerpt(units[0], JD_EXCERPT_TARGET_LEN), 0
+
+    return _clip_excerpt(units[best_idx], JD_EXCERPT_TARGET_LEN), best_idx
+
+
 def select_relevant_jd_excerpt(jd_text: str, hint: str | None = None) -> str:
     """
     Chọn đoạn JD liên quan hint (question/skill/focus/rationale).
     Fallback cuối: snippet đầu JD (giống hành vi cũ).
     """
-    jd = (jd_text or "").strip()
+    excerpt, _ = select_relevant_jd_unit(jd_text, hint)
+    return excerpt
+
+
+def resolve_jd_excerpt_with_index(
+    job_description: str,
+    *,
+    llm_excerpt: str | None = None,
+    hint: str | None = None,
+    used_indexes: set[int] | None = None,
+) -> tuple[str, int]:
+    """
+    SCRUM-394 + SCRUM-425: excerpt + chunk_index từ JD.
+    Ưu tiên LLM verbatim nếu khớp skill; nếu LLM chỉ trích đoạn đầu/generic
+    mà hint khớp unit khác tốt hơn → dùng unit theo hint.
+    """
+    jd = (job_description or "").strip()
     if not jd:
-        return ""
+        return "", JD_CHUNK_INDEX
 
-    hint_tokens = set(_tokenize(hint or ""))
-    if not hint_tokens:
-        return fallback_excerpt(jd)
+    units = _split_jd_units(jd)
+    merged_hint = " ".join(
+        part for part in [(hint or "").strip(), (llm_excerpt or "").strip()] if part
+    )
+    hint_only = (hint or "").strip()
+    hint_excerpt, hint_idx = select_relevant_jd_unit(
+        jd, hint_only or merged_hint or None, used_indexes=used_indexes
+    )
 
-    best = ""
-    best_score = 0
-    for unit in _split_jd_units(jd):
-        unit_tokens = set(_tokenize(unit))
-        if not unit_tokens:
-            continue
-        overlap = hint_tokens & unit_tokens
-        score = len(overlap)
-        # Ưu tiên đoạn có mật độ khớp cao hơn khi cùng số token
-        density = score / max(1, len(unit_tokens))
-        ranked = score * 10 + density
-        if ranked > best_score:
-            best_score = ranked
-            best = unit
+    verbatim = find_verbatim_jd_excerpt(jd, llm_excerpt or "")
+    if verbatim and units:
+        llm_idx = match_jd_unit_index(units, verbatim)
+        if llm_idx is None:
+            llm_idx = 0
+        hint_tokens = set(_tokenize(hint_only))
+        llm_score = _unit_rank_score(units[llm_idx], hint_tokens) if hint_tokens else 0.0
+        hint_score = (
+            _unit_rank_score(units[hint_idx], hint_tokens) if hint_tokens else 0.0
+        )
+        # LLM generic (đầu JD / score thấp) + hint rõ skill khác → ưu tiên hint
+        prefer_hint = (
+            bool(hint_tokens)
+            and hint_score > 0
+            and (llm_idx == 0 or llm_score + 5 < hint_score)
+            and hint_idx != llm_idx
+        )
+        if prefer_hint:
+            return hint_excerpt, hint_idx
+        return _clip_excerpt(verbatim, JD_EXCERPT_TARGET_LEN), int(llm_idx)
 
-    if best_score <= 0 or not best:
-        return fallback_excerpt(jd)
-    return _clip_excerpt(best, JD_EXCERPT_TARGET_LEN)
+    if verbatim:
+        return verbatim, JD_CHUNK_INDEX
+
+    return hint_excerpt, hint_idx
 
 
 def resolve_jd_excerpt(
@@ -207,21 +330,14 @@ def resolve_jd_excerpt(
 ) -> str:
     """
     SCRUM-394: luôn trả excerpt non-empty từ JD khi JD có nội dung.
-    Ưu tiên: LLM excerpt nguyên văn → đoạn JD khớp hint → đầu JD.
+    Ưu tiên: LLM excerpt nguyên văn (nếu không generic) → đoạn JD khớp hint → đầu JD.
     """
-    jd = (job_description or "").strip()
-    if not jd:
-        return ""
-
-    verbatim = find_verbatim_jd_excerpt(jd, llm_excerpt or "")
-    if verbatim:
-        return verbatim
-
-    # LLM paraphrase / sai → chọn đoạn theo hint (kèm excerpt LLM làm tín hiệu)
-    merged_hint = " ".join(
-        part for part in [(hint or "").strip(), (llm_excerpt or "").strip()] if part
+    excerpt, _ = resolve_jd_excerpt_with_index(
+        job_description,
+        llm_excerpt=llm_excerpt,
+        hint=hint,
     )
-    return select_relevant_jd_excerpt(jd, merged_hint or None)
+    return excerpt
 
 
 def make_jd_citation(
@@ -229,17 +345,22 @@ def make_jd_citation(
     excerpt: str | None = None,
     *,
     hint: str | None = None,
+    used_indexes: set[int] | None = None,
+    chunk_index: int | None = None,
 ) -> QuestionCitationItem:
-    """Tạo citation JD chuẩn (nguồn chính) — excerpt luôn trích từ JD khi có thể."""
-    chosen = resolve_jd_excerpt(
+    """Tạo citation JD chuẩn — excerpt + chunk_index theo unit (SCRUM-425)."""
+    chosen, idx = resolve_jd_excerpt_with_index(
         job_description,
         llm_excerpt=excerpt,
         hint=hint,
+        used_indexes=used_indexes,
     )
+    if chunk_index is not None:
+        idx = int(chunk_index)
     return QuestionCitationItem(
         knowledge_base=JD_KNOWLEDGE_BASE,
         source_file=JD_SOURCE_FILE,
-        chunk_index=JD_CHUNK_INDEX,
+        chunk_index=idx,
         excerpt=chosen,
     )
 
@@ -249,10 +370,12 @@ def ensure_jd_primary_citations(
     job_description: str,
     *,
     hint: str | None = None,
+    used_indexes: set[int] | None = None,
 ) -> list[QuestionCitationItem]:
     """
-    SCRUM-392 / SCRUM-394: mọi câu hỏi/plan luôn có JD đứng đầu + excerpt từ JD.
+    SCRUM-392 / SCRUM-394 / SCRUM-425: JD đứng đầu + excerpt/chunk theo skill.
     KB citations giữ nguyên phía sau; dedupe các citation trùng job-description.
+    Nếu truyền used_indexes (mutable set), index đã chọn sẽ được add vào.
     """
     jd_excerpt_from_llm: str | None = None
     others: list[QuestionCitationItem] = []
@@ -267,7 +390,10 @@ def ensure_jd_primary_citations(
         job_description,
         excerpt=jd_excerpt_from_llm,
         hint=hint,
+        used_indexes=used_indexes,
     )
+    if used_indexes is not None and jd.chunk_index is not None:
+        used_indexes.add(int(jd.chunk_index))
     return [jd, *others]
 
 

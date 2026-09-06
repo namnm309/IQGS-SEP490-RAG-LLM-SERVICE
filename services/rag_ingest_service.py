@@ -141,9 +141,13 @@ class RagIngestService:
                     )
 
                 owner_id = request.owner_id if scope == "HR" else None
+                # SCRUM-442: section (loại tài liệu) vào metadata chunk
                 metadata_base = {
                     "fileName": request.file_name,
                     "sourceTitle": request.source_title,
+                    "section": request.section,
+                    "sourceUrl": request.source_url,
+                    "year": request.year,
                 }
                 metadata_base = {k: v for k, v in metadata_base.items() if v is not None}
 
