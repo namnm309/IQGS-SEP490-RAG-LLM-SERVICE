@@ -21,6 +21,7 @@ from services.document_downloader import DocumentDownloader
 from services.document_parser import DocumentParser
 from services.embedding_service import EmbeddingService
 from services.plan_generation_service import PlanGenerationService
+from services.plan_refine_service import PlanRefineService
 from services.candidate_plan_generation_service import CandidatePlanGenerationService
 from services.candidate_question_generation_service import CandidateQuestionGenerationService
 from services.question_assist_service import QuestionAssistService
@@ -29,8 +30,10 @@ from services.evaluate_question_set_service import EvaluateQuestionSetService
 from services.practice_session_insight_service import PracticeSessionInsightService
 from services.question_generation_service import QuestionGenerationService
 from services.rag_ingest_service import RagIngestService
+from services.jd_analyze_service import JdAnalyzeService
 from services.jd_parse_service import JdParseService
 from services.rag_retrieval_service import RagRetrievalService
+from services.recommend_interview_configuration_service import RecommendInterviewConfigurationService
 from vectorstores.pgvector_store import PgVectorStore
 
 logger = logging.getLogger(__name__)
@@ -44,9 +47,12 @@ _openai_client: OpenAI | None = None
 _ingest_service: RagIngestService | None = None
 _question_service: QuestionGenerationService | None = None
 _plan_service: PlanGenerationService | None = None
+_plan_refine_service: PlanRefineService | None = None
 _candidate_question_service: CandidateQuestionGenerationService | None = None
 _candidate_plan_service: CandidatePlanGenerationService | None = None
 _jd_parse_service: JdParseService | None = None
+_jd_analyze_service: JdAnalyzeService | None = None
+_recommend_configuration_service: RecommendInterviewConfigurationService | None = None
 _cv_parse_service: CvParseService | None = None
 _async_generation_service: AsyncGenerationService | None = None
 _async_ingest_service: AsyncIngestService | None = None
@@ -98,6 +104,8 @@ def _wire_chat_client(client: OpenAI) -> None:
         _question_service._client = client  # noqa: SLF001
     if _plan_service is not None:
         _plan_service._client = client  # noqa: SLF001
+    if _plan_refine_service is not None:
+        _plan_refine_service._client = client  # noqa: SLF001
     if _candidate_question_service is not None:
         _candidate_question_service._client = client  # noqa: SLF001
     if _candidate_plan_service is not None:
@@ -112,6 +120,10 @@ def _wire_chat_client(client: OpenAI) -> None:
         _practice_session_insight_service._client = client  # noqa: SLF001
     if _evaluate_question_set_service is not None:
         _evaluate_question_set_service._client = client  # noqa: SLF001
+    if _jd_analyze_service is not None:
+        _jd_analyze_service._client = client  # noqa: SLF001
+    if _recommend_configuration_service is not None:
+        _recommend_configuration_service._client = client  # noqa: SLF001
 
 
 def _wire_embed_client(client: OpenAI) -> None:
@@ -166,9 +178,9 @@ def reload_runtime_config() -> dict:
 
 def startup() -> None:
     global _pool, _vector_store, _chat_client, _embed_client, _openai_client
-    global _ingest_service, _question_service, _plan_service
+    global _ingest_service, _question_service, _plan_service, _plan_refine_service
     global _candidate_question_service, _candidate_plan_service
-    global _jd_parse_service, _cv_parse_service, _async_generation_service, _async_ingest_service
+    global _jd_parse_service, _jd_analyze_service, _recommend_configuration_service, _cv_parse_service, _async_generation_service, _async_ingest_service
     global _question_assist_service, _evaluate_answer_service, _evaluate_question_set_service
     global _practice_session_insight_service
     global _retrieval_service, _embedding_service, _settings_ref
@@ -216,6 +228,11 @@ def startup() -> None:
         client=_chat_client,
         settings=settings,
     )
+    _plan_refine_service = PlanRefineService(
+        retrieval=_retrieval_service,
+        client=_chat_client,
+        settings=settings,
+    )
     _candidate_question_service = CandidateQuestionGenerationService(
         retrieval=_retrieval_service,
         client=_chat_client,
@@ -227,6 +244,12 @@ def startup() -> None:
         settings=settings,
     )
     _jd_parse_service = JdParseService(parser=parser, settings=settings)
+    _jd_analyze_service = JdAnalyzeService(client=_chat_client, settings=settings)
+    _recommend_configuration_service = RecommendInterviewConfigurationService(
+        retrieval=_retrieval_service,
+        client=_chat_client,
+        settings=settings,
+    )
     _cv_parse_service = CvParseService(parser=parser, client=_chat_client, settings=settings)
     _async_generation_service = AsyncGenerationService(
         plan_service=_plan_service,
@@ -244,9 +267,9 @@ def startup() -> None:
 
 def shutdown() -> None:
     global _pool, _vector_store, _chat_client, _embed_client, _openai_client
-    global _ingest_service, _question_service, _plan_service
+    global _ingest_service, _question_service, _plan_service, _plan_refine_service
     global _candidate_question_service, _candidate_plan_service
-    global _jd_parse_service, _cv_parse_service, _async_generation_service, _async_ingest_service
+    global _jd_parse_service, _jd_analyze_service, _recommend_configuration_service, _cv_parse_service, _async_generation_service, _async_ingest_service
     global _question_assist_service, _evaluate_answer_service, _evaluate_question_set_service
     global _practice_session_insight_service
     global _retrieval_service, _embedding_service, _settings_ref
@@ -261,9 +284,12 @@ def shutdown() -> None:
     _ingest_service = None
     _question_service = None
     _plan_service = None
+    _plan_refine_service = None
     _candidate_question_service = None
     _candidate_plan_service = None
     _jd_parse_service = None
+    _jd_analyze_service = None
+    _recommend_configuration_service = None
     _cv_parse_service = None
     _async_generation_service = None
     _async_ingest_service = None
@@ -338,6 +364,26 @@ def get_plan_service() -> PlanGenerationService:
     return _plan_service
 
 
+def get_retrieval_service() -> RagRetrievalService:
+    if _retrieval_service is None:
+        raise RuntimeError("Retrieval service chưa được khởi tạo")
+    try:
+        refresh_runtime_config(force=False)
+    except Exception:
+        pass
+    return _retrieval_service
+
+
+def get_plan_refine_service() -> PlanRefineService:
+    if _plan_refine_service is None:
+        raise RuntimeError("Plan refine service chưa được khởi tạo")
+    try:
+        refresh_runtime_config(force=False)
+    except Exception:
+        pass
+    return _plan_refine_service
+
+
 def get_candidate_question_service() -> CandidateQuestionGenerationService:
     if _candidate_question_service is None:
         raise RuntimeError("Candidate question service chưa được khởi tạo")
@@ -358,10 +404,30 @@ def get_candidate_plan_service() -> CandidatePlanGenerationService:
     return _candidate_plan_service
 
 
+def get_recommend_configuration_service() -> RecommendInterviewConfigurationService:
+    if _recommend_configuration_service is None:
+        raise RuntimeError("Recommend configuration service chưa được khởi tạo")
+    try:
+        refresh_runtime_config(force=False)
+    except Exception:
+        pass
+    return _recommend_configuration_service
+
+
 def get_jd_parse_service() -> JdParseService:
     if _jd_parse_service is None:
         raise RuntimeError("JD parse service chưa được khởi tạo")
     return _jd_parse_service
+
+
+def get_jd_analyze_service() -> JdAnalyzeService:
+    if _jd_analyze_service is None:
+        raise RuntimeError("JD analyze service chưa được khởi tạo")
+    try:
+        refresh_runtime_config(force=False)
+    except Exception:
+        pass
+    return _jd_analyze_service
 
 
 def get_cv_parse_service() -> CvParseService:

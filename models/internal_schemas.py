@@ -1,7 +1,7 @@
 """Pydantic schemas cho internal RAG API."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -98,6 +98,24 @@ class IngestResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
 
+class QuestionDistributionItem(BaseModel):
+    category: str
+    percentage: int
+    question_count: int = Field(..., alias="questionCount")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class FocusAreaItem(BaseModel):
+    name: str
+    weight: float
+    order_index: int = Field(..., alias="orderIndex")
+    description: str | None = None
+    source_reason: str | None = Field(default=None, alias="sourceReason")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class JobGenerationBaseRequest(BaseModel):
     """Shared fields cho generate-questions và generate-plan."""
 
@@ -111,6 +129,12 @@ class JobGenerationBaseRequest(BaseModel):
     )
     skills: list[str] = Field(default_factory=list)
     hr_note: str | None = Field(default=None, alias="hrNote", max_length=2000)
+    # SCRUM-417: HR đã confirm cấp độ — plan.experience_level phải khớp (optional).
+    experience_level: ExperienceLevelType | None = Field(
+        default=None,
+        alias="experienceLevel",
+        description="intern|junior|mid|senior|lead — ưu tiên hơn suy luận từ JD khi có",
+    )
     language: str | None = Field(
         default=None,
         alias="language",
@@ -122,6 +146,13 @@ class JobGenerationBaseRequest(BaseModel):
         alias="documentIds",
         description="Optional HR knowledge document IDs to restrict retrieval",
     )
+    question_distribution: list[QuestionDistributionItem] | None = Field(
+        default=None,
+        alias="questionDistribution",
+    )
+    focus_areas: list[FocusAreaItem] | None = Field(default=None, alias="focusAreas")
+    question_styles: list[str] | None = Field(default=None, alias="questionStyles")
+    coding_task_types: list[str] | None = Field(default=None, alias="codingTaskTypes")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -136,6 +167,13 @@ class JobGenerationBaseRequest(BaseModel):
     @classmethod
     def normalize_question_types(cls, value: object) -> object:
         return normalize_question_types_list(value)
+
+    @field_validator("experience_level", mode="before")
+    @classmethod
+    def normalize_optional_experience_level(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not str(value).strip()):
+            return None
+        return normalize_experience_level(str(value))
 
 
 class GenerateQuestionsRequest(JobGenerationBaseRequest):
@@ -158,16 +196,34 @@ class GenerateQuestionsAsyncRequest(GenerateQuestionsRequest):
     model_config = ConfigDict(populate_by_name=True)
 
 
+PlanOriginType = Literal["HR", "SYSTEM", "LLM"]
+
+
 class QuestionCitationItem(BaseModel):
     knowledge_base: str = Field(..., alias="knowledgeBase")
     source_file: str = Field(..., alias="sourceFile")
     chunk_index: int = Field(..., alias="chunkIndex")
     excerpt: str = ""
+    # SCRUM-421: waterfall provenance trên từng citation
+    origin: PlanOriginType | None = None
+    used_for: list[str] = Field(default_factory=list, alias="usedFor")
+    reason: str | None = None
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
 
 PlanCitationItem = QuestionCitationItem
+
+
+class RubricCriterionItem(BaseModel):
+    """SCRUM-418: Một tiêu chí chấm có trọng số và mốc."""
+
+    id: str = ""
+    label: str = ""
+    weight: int = 0
+    anchors: dict[str, str] = Field(default_factory=dict)
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
 
 class GeneratedQuestionItem(BaseModel):
@@ -180,7 +236,7 @@ class GeneratedQuestionItem(BaseModel):
     order: int | None = None
     skill: str | None = None
     focus_area: str | None = Field(default=None, alias="focusArea")
-    evaluation_criteria: list[str] = Field(
+    evaluation_criteria: list[RubricCriterionItem | str] = Field(
         default_factory=list, alias="evaluationCriteria"
     )
     code_template_type: str | None = Field(default=None, alias="codeTemplateType")
@@ -190,6 +246,14 @@ class GeneratedQuestionItem(BaseModel):
     # SCRUM-400: Candidate UI — Text (textarea) | Code (ô nhập code)
     answer_method: Literal["Text", "Code"] | None = Field(
         default=None, alias="answerMethod"
+    )
+
+    # SCRUM-421: provenance tóm tắt + cảnh báo thiếu Admin KB
+    source_provenance: ProvenanceBlock | None = Field(
+        default=None, alias="sourceProvenance"
+    )
+    missing_admin_warning: bool | None = Field(
+        default=None, alias="missingAdminWarning"
     )
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
@@ -226,6 +290,84 @@ class SkillCoverageItem(BaseModel):
     focus_areas: list[str] = Field(default_factory=list, alias="focusAreas")
     # SCRUM-369: tên file RAG (source_file) gắn với focus — Studio UI hiển thị
     source_files: list[str] = Field(default_factory=list, alias="sourceFiles")
+    # SCRUM-420: provenance waterfall HR → SYSTEM → LLM
+    provenance: "ProvenanceBlock | None" = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class ProvenanceItem(BaseModel):
+    origin: PlanOriginType
+    source_file: str | None = Field(default=None, alias="sourceFile")
+    chunk_index: int | None = Field(default=None, alias="chunkIndex")
+    excerpt: str | None = None
+    used_for: list[str] = Field(default_factory=list, alias="usedFor")
+    reason: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class ProvenanceBlock(BaseModel):
+    primary_origin: PlanOriginType = Field(..., alias="primaryOrigin")
+    items: list[ProvenanceItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class PlanPatch(BaseModel):
+    """Delta refine — field null/omit = giữ baseline."""
+
+    replace_coverage: list[SkillCoverageItem] | None = Field(
+        default=None, alias="replaceCoverage"
+    )
+    replace_skills: list[str] | None = Field(default=None, alias="replaceSkills")
+    replace_outline: list["RecommendedQuestionOutlineItem"] | None = Field(
+        default=None, alias="replaceOutline"
+    )
+    replace_question_type_distribution: list[QuestionTypeDistributionItem] | None = (
+        Field(default=None, alias="replaceQuestionTypeDistribution")
+    )
+    replace_difficulty_distribution: list[DifficultyDistributionItem] | None = Field(
+        default=None, alias="replaceDifficultyDistribution"
+    )
+    update_summary: str | None = Field(default=None, alias="updateSummary")
+    replace_citations: list[PlanCitationItem] | None = Field(
+        default=None, alias="replaceCitations"
+    )
+    instruction_applied: str | None = Field(default=None, alias="instructionApplied")
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+    def has_changes(self) -> bool:
+        return any(
+            [
+                self.replace_coverage,
+                self.replace_skills,
+                self.replace_outline,
+                self.replace_question_type_distribution,
+                self.replace_difficulty_distribution,
+                self.update_summary,
+                self.replace_citations,
+                self.instruction_applied,
+            ]
+        )
+
+
+class RefinePlanRequest(JobGenerationBaseRequest):
+    baseline_plan: dict[str, Any] = Field(..., alias="baselinePlan")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RefinePlanResponse(BaseModel):
+    success: bool
+    patch: PlanPatch | None = None
+    processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
+    error: str | None = None
+    detail: str | None = None
+    stage: str | None = None
+    exception_type: str | None = Field(default=None, alias="exceptionType")
+    errors: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
@@ -237,6 +379,10 @@ class RecommendedQuestionOutlineItem(BaseModel):
     skill: str = ""
     focus_area: str = Field(default="", alias="focusArea")
     goal: str = ""
+    # Text = lý thuyết | Code = coding — HR chỉnh trên live preview
+    answer_method: str | None = Field(default=None, alias="answerMethod")
+    # SCRUM-426: nguồn đã khóa (JD why-asked + Admin technical-body) — Gen copy
+    citations: list[PlanCitationItem] = Field(default_factory=list)
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
@@ -285,15 +431,78 @@ class GeneratePlanResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
 
+class BindOutlineSourcesRequest(BaseModel):
+    """SCRUM-426: khóa/rebind citations trên outline (Apply Live Preview)."""
+
+    owner_id: str = Field(..., alias="ownerId")
+    job_description: str = Field(..., alias="jobDescription")
+    outline: list[RecommendedQuestionOutlineItem] = Field(default_factory=list)
+    document_ids: list[str] | None = Field(default=None, alias="documentIds")
+    force_rebind: bool = Field(default=False, alias="forceRebind")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class BindOutlineSourcesResponse(BaseModel):
+    success: bool
+    outline: list[RecommendedQuestionOutlineItem] = Field(default_factory=list)
+    processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
+    error: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class RetrieveRequest(BaseModel):
+    """SCRUM-443/444: retrieve mỏng cho suggestions + preview."""
+
+    owner_id: str = Field(..., alias="ownerId")
+    job_description: str = Field(..., alias="jobDescription")
+    document_ids: list[str] = Field(default_factory=list, alias="documentIds")
+    query_extra: str | None = Field(default=None, alias="queryExtra")
+    top_k_system: int | None = Field(default=None, alias="topKSystem")
+    top_k_hr: int | None = Field(default=None, alias="topKHr")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RetrievedChunkDto(BaseModel):
+    document_id: str = Field(..., alias="documentId")
+    chunk_index: int = Field(..., alias="chunkIndex")
+    content: str
+    scope: str
+    score: float
+    file_name: str | None = Field(default=None, alias="fileName")
+    section: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class RetrieveResponse(BaseModel):
+    success: bool
+    system_chunks: list[RetrievedChunkDto] = Field(default_factory=list, alias="systemChunks")
+    hr_chunks: list[RetrievedChunkDto] = Field(default_factory=list, alias="hrChunks")
+    processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
+    error: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
 class GenerateQuestionsFromPlanRequest(BaseModel):
     owner_id: str = Field(..., alias="ownerId")
     job_description: str = Field(..., alias="jobDescription")
     approved_plan: QuestionGenerationPlan = Field(..., alias="approvedPlan")
-    hr_note: str | None = Field(default=None, alias="hrNote", max_length=2000)
+    # SCRUM-429: AVOID_QUESTIONS có thể dài — tăng trần hrNote
+    hr_note: str | None = Field(default=None, alias="hrNote", max_length=8000)
     language: str | None = Field(
         default=None,
         alias="language",
         description="Vietnamese | English — ngôn ngữ câu hỏi sinh ra",
+    )
+    # SCRUM-388/421: filter HR chunks Selected (mirror plan generation)
+    document_ids: list[str] = Field(
+        default_factory=list,
+        alias="documentIds",
+        description="Optional HR knowledge document IDs to restrict retrieval",
     )
 
     model_config = ConfigDict(populate_by_name=True)
@@ -417,6 +626,75 @@ class ParseJdResponse(BaseModel):
     file_name: str | None = Field(default=None, alias="fileName")
     warnings: list[str] = Field(default_factory=list)
     stats: dict | None = None
+    error: str | None = None
+    detail: str | None = None
+    stage: str | None = None
+    exception_type: str | None = Field(default=None, alias="exceptionType")
+    errors: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class AnalyzeJdRequest(BaseModel):
+    """SCRUM-416: phân tích metadata JD bằng LLM — không bịa giá trị mặc định."""
+
+    job_description: str = Field(..., alias="jobDescription")
+    file_name: str | None = Field(default=None, alias="fileName")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AnalyzeJdResponse(BaseModel):
+    success: bool
+    position: str | None = None
+    job_title: str | None = Field(default=None, alias="jobTitle")
+    detected_role: str | None = Field(default=None, alias="detectedRole")
+    detected_seniority: str | None = Field(default=None, alias="detectedSeniority")
+    experience_level: str | None = Field(default=None, alias="experienceLevel")
+    detected_language: str | None = Field(default=None, alias="detectedLanguage")
+    skills: list[str] = Field(default_factory=list)
+    responsibilities: list[str] = Field(default_factory=list)
+    summary: str | None = None
+    # SCRUM-432: classify trước lưu — chỉ pass khi job_description + isItRole
+    document_type: str | None = Field(default=None, alias="documentType")
+    is_it_role: bool | None = Field(default=None, alias="isItRole")
+    reject_reason: str | None = Field(default=None, alias="rejectReason")
+    error: str | None = None
+    detail: str | None = None
+    stage: str | None = None
+    exception_type: str | None = Field(default=None, alias="exceptionType")
+    errors: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class JobProfileInput(BaseModel):
+    job_title: str | None = Field(default=None, alias="jobTitle")
+    experience_level: str | None = Field(default=None, alias="experienceLevel")
+    detected_role: str | None = Field(default=None, alias="detectedRole")
+    detected_language: str | None = Field(default=None, alias="detectedLanguage")
+    skills: list[str] = Field(default_factory=list)
+    responsibilities: list[str] = Field(default_factory=list)
+    summary: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RecommendInterviewConfigurationRequest(BaseModel):
+    owner_id: str = Field(..., alias="ownerId")
+    job_description: str = Field(..., alias="jobDescription")
+    job_profile: JobProfileInput = Field(..., alias="jobProfile")
+    document_ids: list[str] = Field(default_factory=list, alias="documentIds")
+    number_of_questions: int | None = Field(default=None, alias="numberOfQuestions", ge=1, le=50)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RecommendInterviewConfigurationResponse(BaseModel):
+    success: bool
+    recommended_configuration: dict | None = Field(
+        default=None, alias="recommendedConfiguration"
+    )
     error: str | None = None
     detail: str | None = None
     stage: str | None = None
