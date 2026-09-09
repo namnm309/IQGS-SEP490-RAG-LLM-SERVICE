@@ -21,7 +21,11 @@ from models.internal_schemas import (
     JdFitSuggestedActionItem,
 )
 from services.json_output_parser import build_json_fix_prompt, extract_json_object, is_retryable_json_error
-from services.rag_context_helpers import _split_jd_units, select_relevant_jd_excerpt
+from services.rag_context_helpers import (
+    _split_jd_units,
+    match_jd_unit_index,
+    select_relevant_jd_excerpt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -335,7 +339,7 @@ class EvaluateQuestionSetService:
     @classmethod
     def _fallback_flag_sources(cls, units: list[str], job_description: str, hint: str) -> list[JdFitSourceItem]:
         excerpt = select_relevant_jd_excerpt(job_description, hint or None)
-        idx = cls._match_unit_index(units, excerpt)
+        idx = match_jd_unit_index(units, excerpt)
         if idx is None:
             return []
         return [JdFitSourceItem(chunk_index=idx, excerpt=units[idx][:_EXCERPT_CAP])]
@@ -360,22 +364,6 @@ class EvaluateQuestionSetService:
         if not result and units:
             result.append(JdFitSourceItem(chunk_index=0, excerpt=units[0][:_EXCERPT_CAP]))
         return result
-
-    @staticmethod
-    def _match_unit_index(units: list[str], excerpt: str) -> int | None:
-        text = (excerpt or "").strip()
-        if not units:
-            return None
-        if not text:
-            return 0
-        for i, unit in enumerate(units):
-            if text in unit or unit in text:
-                return i
-        needle = text[:40].lower()
-        for i, unit in enumerate(units):
-            if needle and needle in unit.lower():
-                return i
-        return 0
 
     def _parse_actions(self, raw: Any) -> list[JdFitSuggestedActionItem]:
         if not isinstance(raw, list):

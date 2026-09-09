@@ -65,7 +65,7 @@ audience=jd_practice: luyện theo JD mục tiêu + gap trong note.
 ## Chuẩn chất lượng (bắt buộc)
 1. Câu hỏi chuyên nghiệp: ngắn gọn, không mơ hồ, không gợi đáp án, không “hãy kể về bản thân” chung chung.
 2. Ưu tiên technical; có thể 1–2 câu problem-solving/system-design nếu skill phù hợp. Không multiple-choice.
-3. Mỗi câu tập trung MỘT ý (một skill / một focus_area). evaluation_criteria 3–5 ý có thể chấm.
+3. Mỗi câu tập trung MỘT ý (một skill / một focus_area). evaluation_criteria 3–4 object có weight (tổng 100) và anchors "25","50","75","100".
 4. sample_answer: đáp án chuẩn mực 4–8 câu, đúng kiến thức, không lan man.
 5. {language_rule}
 6. Chỉ JSON hợp lệ, không markdown ngoài JSON. Không image_hint. answer_method mặc định Text.
@@ -91,7 +91,19 @@ audience=jd_practice: luyện theo JD mục tiêu + gap trong note.
       "focus_area": "string",
       "rationale": "string — vì sao câu này đánh giá được skill trên CV",
       "sample_answer": "string",
-      "evaluation_criteria": ["string"],
+      "evaluation_criteria": [
+        {{
+          "id": "accuracy",
+          "label": "Hiểu đúng khái niệm",
+          "weight": 40,
+          "anchors": {{
+            "25": "Chưa giải thích được",
+            "50": "Nêu định nghĩa cơ bản",
+            "75": "Có ví dụ cụ thể",
+            "100": "Nêu edge case liên quan"
+          }}
+        }}
+      ],
       "answer_method": "Text",
       "citations": []
     }}
