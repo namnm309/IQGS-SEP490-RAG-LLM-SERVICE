@@ -9,7 +9,7 @@ from docx import Document as DocxDocument
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = frozenset({".pdf", ".docx", ".txt"})
+SUPPORTED_EXTENSIONS = frozenset({".pdf", ".docx", ".txt", ".jsonl"})
 
 
 class DocumentParser:
@@ -22,6 +22,12 @@ class DocumentParser:
         if ext not in SUPPORTED_EXTENSIONS:
             raise ValueError(
                 f"Định dạng '{ext}' không hỗ trợ. Hỗ trợ: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            )
+
+        # SCRUM-448: .jsonl đi nhánh JsonlQaChunker trong ingest — không parse plain text
+        if ext == ".jsonl":
+            raise ValueError(
+                "File .jsonl phải dùng JsonlQaChunker (1 record = 1 chunk), không parse plain text"
             )
 
         if ext == ".pdf":
