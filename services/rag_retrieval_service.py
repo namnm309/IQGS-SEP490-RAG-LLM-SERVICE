@@ -65,8 +65,10 @@ class RagRetrievalService:
         *,
         top_k_system: int | None = None,
         query_extra: str | None = None,
+        document_ids: list[str] | None = None,
+        metadata_filters: dict | None = None,
     ) -> list[RetrievedChunk]:
-        """Retrieve chỉ SYSTEM — luồng Candidate không dùng HR knowledge theo owner."""
+        """Retrieve chỉ SYSTEM — optional filter document_ids + jsonb metadata (Tech vs Roadmap)."""
         parts = [query_text.strip()]
         if query_extra and query_extra.strip():
             extra = query_extra.strip()
@@ -74,10 +76,12 @@ class RagRetrievalService:
                 extra = extra[:1500]
             parts.append(extra)
         query_embedding = self._embedding.embed_query("\n\n".join(parts))
+        doc_ids = [d.strip() for d in (document_ids or []) if d and str(d).strip()]
         return self._store.similarity_search(
             query_embedding,
             scope="SYSTEM",
             owner_id=None,
             top_k=top_k_system or self._settings.top_k_system,
-            document_ids=None,
+            document_ids=doc_ids or None,
+            metadata_filters=metadata_filters,
         )

@@ -40,4 +40,5 @@ class VectorStore(Protocol):
         owner_id: str | None,
         top_k: int,
         document_ids: list[str] | None = None,
+        metadata_filters: dict[str, Any] | None = None,
     ) -> list[RetrievedChunk]: ...

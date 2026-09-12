@@ -158,6 +158,7 @@ class PgVectorStore:
         owner_id: str | None,
         top_k: int,
         document_ids: list[str] | None = None,
+        metadata_filters: dict[str, Any] | None = None,
     ) -> list[RetrievedChunk]:
         self._validate_embedding(query_embedding)
         scope_upper = scope.upper()
@@ -167,29 +168,49 @@ class PgVectorStore:
         if scope_upper == "HR" and not owner_id:
             raise ValueError("HR search bắt buộc owner_id")
 
-        # SCRUM-443: HR chỉ retrieve khi có document_ids Selected.
-        # document_ids rỗng/null → không lấy chunk HR (tránh fallback toàn thư viện).
+        # SCRUM-443/447: HR bắt buộc document_ids; SYSTEM có thể filter theo curated Tech/Roadmap ids.
         doc_ids = [d.strip() for d in (document_ids or []) if d and str(d).strip()]
-        use_doc_filter = scope_upper == "HR" and len(doc_ids) > 0
+        use_doc_filter = len(doc_ids) > 0
+        meta_sql, meta_params = self._metadata_filter_clause(metadata_filters)
 
         if scope_upper == "SYSTEM":
-            sql = """
-                SELECT
-                    document_id,
-                    chunk_index,
-                    content,
-                    scope,
-                    owner_id,
-                    metadata,
-                    1 - (embedding <=> %s::vector) AS score
-                FROM tbl_knowledge_chunks
-                WHERE scope = 'SYSTEM' AND owner_id IS NULL
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """
-            params: list[object] = [query_embedding, query_embedding, top_k]
-        elif use_doc_filter:
-            sql = """
+            if use_doc_filter:
+                sql = f"""
+                    SELECT
+                        document_id,
+                        chunk_index,
+                        content,
+                        scope,
+                        owner_id,
+                        metadata,
+                        1 - (embedding <=> %s::vector) AS score
+                    FROM tbl_knowledge_chunks
+                    WHERE scope = 'SYSTEM' AND owner_id IS NULL
+                      AND document_id = ANY(%s)
+                      {meta_sql}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                params: list[object] = [query_embedding, doc_ids, *meta_params, query_embedding, top_k]
+            else:
+                sql = f"""
+                    SELECT
+                        document_id,
+                        chunk_index,
+                        content,
+                        scope,
+                        owner_id,
+                        metadata,
+                        1 - (embedding <=> %s::vector) AS score
+                    FROM tbl_knowledge_chunks
+                    WHERE scope = 'SYSTEM' AND owner_id IS NULL
+                      {meta_sql}
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """
+                params = [query_embedding, *meta_params, query_embedding, top_k]
+        elif scope_upper == "HR" and use_doc_filter:
+            sql = f"""
                 SELECT
                     document_id,
                     chunk_index,
@@ -201,10 +222,11 @@ class PgVectorStore:
                 FROM tbl_knowledge_chunks
                 WHERE scope = 'HR' AND owner_id = %s
                   AND document_id = ANY(%s)
+                  {meta_sql}
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
             """
-            params = [query_embedding, owner_id, doc_ids, query_embedding, top_k]
+            params = [query_embedding, owner_id, doc_ids, *meta_params, query_embedding, top_k]
         else:
             # SCRUM-443: không tick file = không dùng kho HR
             return []
@@ -230,6 +252,22 @@ class PgVectorStore:
                         )
                     )
         return results
+
+    @staticmethod
+    def _metadata_filter_clause(
+        metadata_filters: dict[str, Any] | None,
+    ) -> tuple[str, list[object]]:
+        """jsonb containment — chỉ khớp documentType/roleKey/level/skill đã ghi lúc ingest."""
+        if not metadata_filters:
+            return "", []
+        cleaned = {
+            key: value
+            for key, value in metadata_filters.items()
+            if value is not None and str(value).strip() != ""
+        }
+        if not cleaned:
+            return "", []
+        return " AND metadata @> %s::jsonb", [json.dumps(cleaned)]
 
     def ping(self) -> bool:
         with self._pool.connection() as conn:
