@@ -17,7 +17,14 @@ import httpx
 from openai import OpenAI
 
 from config.settings import Settings
+from helpers.jd_validator import validate_it_domain
 from models.internal_schemas import ParseCvResponse
+from services.document_classify import (
+    check_pass_rules,
+    clean_reject_reason,
+    normalize_bool,
+    normalize_document_type,
+)
 from services.document_parser import DocumentParser
 from services.json_output_parser import (
     build_json_fix_prompt,
@@ -39,29 +46,42 @@ _MIME_BY_EXT = {
     ".png": "image/png",
 }
 
-CV_SYSTEM_PROMPT = """Bạn là trợ lý AI phân tích CV/hồ sơ ứng viên công nghệ.
+CV_SYSTEM_PROMPT = """Bạn là trợ lý AI phân tích CV/hồ sơ ứng viên công nghệ (SCRUM-466).
 
 ## Nhiệm vụ
-Đọc nội dung CV (văn bản hoặc ảnh) và trích xuất:
-1. skills: danh sách kỹ năng công nghệ (ngôn ngữ, framework, database, công cụ, nền tảng...).
-2. summary: tóm tắt ngắn 1-3 câu về ứng viên (vai trò, kinh nghiệm nổi bật).
+1) Phân loại: documentType + isItRole + rejectReason.
+2) Nếu là CV IT: trích skills / summary / suggestedRole / yearsOfExperienceHint.
 
-## Quy tắc bắt buộc
-1. CHỈ trả về JSON hợp lệ, không markdown fence, không text ngoài JSON.
-2. KHÔNG bịa kỹ năng không xuất hiện trong CV.
-3. skills là mảng chuỗi, mỗi phần tử là tên kỹ năng chuẩn hóa (ví dụ "ASP.NET Core", "PostgreSQL").
-4. Nếu không tìm thấy kỹ năng nào, trả skills = [].
-5. summary viết bằng tiếng Việt, ngắn gọn; nếu không đủ thông tin để tóm tắt thì để chuỗi rỗng.
+## Quy tắc classify (BẮT BUỘC)
+1. documentType chỉ một trong: resume | article | documentation | other
+   (resume = CV/hồ sơ cá nhân; không phải JD tuyển dụng).
+2. isItRole = true chỉ khi hồ sơ CHÍNH thuộc IT/phần mềm.
+3. Marketing/Sales/Kế toán/Luật dù có Excel → isItRole = false; documentType vẫn có thể là resume.
+4. rejectReason: 1 câu tiếng Việt nếu không phải CV IT; null nếu pass (resume + isItRole=true).
+
+## Quy tắc extract
+5. CHỈ trả JSON hợp lệ, không markdown fence.
+6. KHÔNG bịa kỹ năng không có trong CV.
+7. skills: mảng chuỗi chuẩn hóa; [] nếu không có.
+8. summary tiếng Việt ngắn; chuỗi rỗng nếu thiếu thông tin.
+9. TUYỆT ĐỐI KHÔNG suy luận level (intern/fresher/junior/middle/senior/lead).
+10. suggestedRole chỉ gợi ý role — null nếu thiếu căn cứ.
 
 ## Schema JSON
 {
+  "documentType": "resume|article|documentation|other",
+  "isItRole": true,
+  "rejectReason": "string|null",
   "skills": ["string"],
-  "summary": "string"
+  "summary": "string",
+  "suggestedRole": "string|null",
+  "yearsOfExperienceHint": number|null
 }
 """
 
 CV_USER_INSTRUCTION = (
-    "Trích kỹ năng và tóm tắt từ CV sau. Chỉ trả về JSON theo schema đã cho."
+    "Phân loại (documentType/isItRole) rồi trích kỹ năng từ CV sau. "
+    "Không kết luận Fresher/Junior/Middle/Senior. Chỉ trả về JSON theo schema đã cho."
 )
 
 
@@ -125,6 +145,16 @@ class CvParseService:
                 )
             else:
                 text = self._extract_document_text(file_bytes, file_name)
+                # SCRUM-466 L1: keyword IT trước khi tốn token LLM
+                l1_err = validate_it_domain(text)
+                if l1_err:
+                    return None, build_rag_error_detail(
+                        error="CV không thuộc IT",
+                        detail=l1_err,
+                        stage="CV_CLASSIFY",
+                        exception_type="NotItDomainL1",
+                        errors=[l1_err],
+                    ), 422
                 caller = lambda fix: self._call_llm_text(text, fix_prompt=fix)
         except ValueError as exc:
             return None, build_rag_error_detail(
@@ -170,14 +200,55 @@ class CvParseService:
                 errors=[err] if err else [],
             ), 502
 
+        document_type = normalize_document_type(
+            parsed.get("documentType") or parsed.get("document_type")
+        )
+        is_it_role = normalize_bool(
+            parsed.get("isItRole") if "isItRole" in parsed else parsed.get("is_it_role")
+        )
+        reject_reason = clean_reject_reason(
+            parsed.get("rejectReason") or parsed.get("reject_reason")
+        )
+
+        # SCRUM-466 L2: phải là resume IT
+        classify = check_pass_rules("cv", document_type, is_it_role, reject_reason)
+        if not classify.success:
+            return None, build_rag_error_detail(
+                error=classify.error or "CV không hợp lệ",
+                detail=classify.detail,
+                stage="CV_CLASSIFY",
+                exception_type=classify.exception_type or "NotItDocument",
+                errors=classify.errors or [],
+            ), 422
+
         skills = self._normalize_skills(parsed.get("skills"))
+        if not skills:
+            return None, build_rag_error_detail(
+                error="CV không có kỹ năng IT",
+                detail="Không tìm thấy kỹ năng IT trong CV. Vui lòng tải lên CV kỹ thuật có tech stack rõ ràng.",
+                stage="CV_CLASSIFY",
+                exception_type="CvNoItSkills",
+                errors=["Không tìm thấy kỹ năng IT trong CV."],
+            ), 422
+
         summary = self._normalize_summary(parsed.get("summary"))
+        suggested_role = self._normalize_optional_str(
+            parsed.get("suggestedRole") or parsed.get("suggested_role")
+        )
+        years_hint = self._normalize_years(
+            parsed.get("yearsOfExperienceHint") or parsed.get("years_of_experience_hint")
+        )
 
         return ParseCvResponse(
             success=True,
             skills=skills,
             summary=summary,
             file_name=file_name,
+            suggested_role=suggested_role,
+            years_of_experience_hint=years_hint,
+            document_type=document_type or "resume",
+            is_it_role=True,
+            reject_reason=None,
         ), None, 200
 
     def _extract_document_text(self, file_bytes: bytes, file_name: str) -> str:
@@ -257,3 +328,28 @@ class CvParseService:
             return None
         text = str(raw).strip()
         return text or None
+
+    @staticmethod
+    def _normalize_optional_str(raw: Any) -> str | None:
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        # Chặn giá trị level bị nhầm vào suggestedRole
+        banned = {"fresher", "junior", "middle", "mid", "senior", "intern", "lead"}
+        if text.lower() in banned:
+            return None
+        return text
+
+    @staticmethod
+    def _normalize_years(raw: Any) -> float | None:
+        if raw is None or raw == "":
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if value < 0 or value > 60:
+            return None
+        return value
