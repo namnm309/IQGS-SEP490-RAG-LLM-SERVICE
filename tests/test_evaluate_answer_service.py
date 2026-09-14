@@ -49,7 +49,7 @@ class _FakeClient:
 def _service() -> EvaluateAnswerService:
     return EvaluateAnswerService(
         client=_FakeClient(),
-        settings=type("S", (), {"chat_model": "test"})(),
+        settings=type("S", (), {"chat_model": "test", "temperature": 0.2})(),
     )
 
 

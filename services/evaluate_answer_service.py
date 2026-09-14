@@ -1,4 +1,4 @@
-"""Đánh giá câu trả lời Candidate theo rubric (SCRUM-281)."""
+"""Đánh giá câu trả lời Candidate theo rubric (SCRUM-281) + Coach dimensions (SCRUM-447)."""
 from __future__ import annotations
 
 import json
@@ -38,6 +38,30 @@ EVALUATE_ANSWER_SYSTEM_PROMPT = """Bạn là giám khảo phỏng vấn AI, ch�
 }
 """
 
+# SCRUM-447: Coach assessment — LLM chỉ chấm dimensions; Backend tính AnswerScore/SkillScore.
+EVALUATE_COACH_SYSTEM_PROMPT = """Bạn là giám khảo Coach competency. Chỉ chấm 3 chiều — KHÔNG kết luận Fresher/Junior/Middle/Senior.
+
+## Quy tắc bắt buộc
+1. Trả lời bằng TIẾNG VIỆT, chỉ JSON hợp lệ.
+2. BẮT BUỘC dimensionScores với đúng 3 key: correctness, relevance, clarity (mỗi chiều 0–100).
+3. score (optional): có thể để null — Backend sẽ tính overall. Nếu có score thì chỉ là gợi ý hiển thị, không thay công thức Backend.
+4. strengths / improvements / suggestion như bình thường.
+5. sampleAnswer chỉ dùng nội bộ — không nhắc trong feedback.
+
+## Schema JSON
+{
+  "score": null,
+  "strengths": ["string"],
+  "improvements": ["string"],
+  "suggestion": "string",
+  "dimensionScores": {
+    "correctness": 0-100,
+    "relevance": 0-100,
+    "clarity": 0-100
+  }
+}
+"""
+
 
 class EvaluateAnswerService:
     def __init__(self, client: OpenAI, settings: Settings) -> None:
@@ -60,11 +84,18 @@ class EvaluateAnswerService:
                     processing_time_ms=self._elapsed_ms(started),
                 )
 
+            is_coach = (request.scoring_mode or "").strip().lower() == "coach"
+            system_prompt = EVALUATE_COACH_SYSTEM_PROMPT if is_coach else EVALUATE_ANSWER_SYSTEM_PROMPT
+
             payload = self._build_user_payload(request)
-            raw = self._call_llm(payload)
+            raw = self._call_llm(payload, system_prompt=system_prompt)
             parsed, err = extract_json_object(raw)
             if parsed is None and err and is_retryable_json_error(err):
-                raw = self._call_llm(payload, fix_prompt=build_json_fix_prompt(raw))
+                raw = self._call_llm(
+                    payload,
+                    system_prompt=system_prompt,
+                    fix_prompt=build_json_fix_prompt(raw),
+                )
                 parsed, err = extract_json_object(raw)
 
             if parsed is None:
@@ -74,11 +105,26 @@ class EvaluateAnswerService:
                     processing_time_ms=self._elapsed_ms(started),
                 )
 
+            dimension_scores = self._parse_dimension_scores(
+                parsed.get("dimensionScores") or parsed.get("dimension_scores")
+            )
+            if is_coach:
+                dimension_scores = self._ensure_coach_dimensions(dimension_scores, parsed)
+
             score = self._parse_score(parsed.get("score"))
-            if score is None:
+            if score is None and is_coach and dimension_scores:
+                # UI fallback — Backend Coach vẫn tính lại từ dimensions
+                score = sum(dimension_scores.values()) / len(dimension_scores)
+            if score is None and not is_coach:
                 return EvaluateAnswerResponse(
                     success=False,
                     error="LLM trả về score không hợp lệ.",
+                    processing_time_ms=self._elapsed_ms(started),
+                )
+            if is_coach and not dimension_scores:
+                return EvaluateAnswerResponse(
+                    success=False,
+                    error="Coach evaluate thiếu dimensionScores (correctness/relevance/clarity).",
                     processing_time_ms=self._elapsed_ms(started),
                 )
 
@@ -88,7 +134,7 @@ class EvaluateAnswerService:
                 strengths=self._parse_string_list(parsed.get("strengths")),
                 improvements=self._parse_string_list(parsed.get("improvements")),
                 suggestion=self._parse_optional_str(parsed.get("suggestion")),
-                dimension_scores=self._parse_dimension_scores(parsed.get("dimensionScores") or parsed.get("dimension_scores")),
+                dimension_scores=dimension_scores,
                 processing_time_ms=self._elapsed_ms(started),
             )
         except Exception as exc:
@@ -109,12 +155,19 @@ class EvaluateAnswerService:
             "jdContext": request.jd_context,
             "skill": request.skill,
             "questionType": request.question_type,
+            "scoringMode": request.scoring_mode,
         }
         return json.dumps(body, ensure_ascii=False, indent=2)
 
-    def _call_llm(self, user_payload: str, *, fix_prompt: str | None = None) -> str:
+    def _call_llm(
+        self,
+        user_payload: str,
+        *,
+        system_prompt: str = EVALUATE_ANSWER_SYSTEM_PROMPT,
+        fix_prompt: str | None = None,
+    ) -> str:
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": EVALUATE_ANSWER_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_payload},
         ]
         if fix_prompt:
@@ -126,6 +179,38 @@ class EvaluateAnswerService:
             temperature=self._settings.temperature,
         )
         return (response.choices[0].message.content or "").strip()
+
+    @classmethod
+    def _ensure_coach_dimensions(
+        cls, dims: dict[str, float] | None, parsed: dict[str, Any]
+    ) -> dict[str, float] | None:
+        """Chuẩn hóa aliases → correctness/relevance/clarity."""
+        source = dict(dims or {})
+        # Một số model trả key riêng ngoài dimensionScores
+        for key in ("correctness", "relevance", "clarity", "accuracy"):
+            if key in parsed and key not in source:
+                try:
+                    source[key] = max(0.0, min(100.0, float(parsed[key])))
+                except (TypeError, ValueError):
+                    pass
+
+        def pick(*names: str) -> float | None:
+            for n in names:
+                for k, v in source.items():
+                    if k.lower() == n.lower():
+                        return float(v)
+            return None
+
+        correctness = pick("correctness", "accuracy")
+        relevance = pick("relevance")
+        clarity = pick("clarity")
+        if correctness is None or relevance is None or clarity is None:
+            return None
+        return {
+            "correctness": correctness,
+            "relevance": relevance,
+            "clarity": clarity,
+        }
 
     @staticmethod
     def _parse_score(raw: Any) -> float | None:
