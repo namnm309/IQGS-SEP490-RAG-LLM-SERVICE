@@ -19,6 +19,8 @@ from api.deps import (
     get_question_assist_service,
     get_question_service,
     get_retrieval_service,
+    get_roadmap_recommendation_service,
+    get_adaptive_competency_service,
     get_settings_ref,
     reload_runtime_config,
 )
@@ -61,6 +63,14 @@ from models.internal_schemas import (
     RetrieveRequest,
     RetrieveResponse,
     RetrievedChunkDto,
+    RoadmapRecommendRequest,
+    RoadmapRecommendResponse,
+    CompetencyContextRequest,
+    CompetencyContextResponse,
+    AdaptiveBlueprintRequest,
+    AdaptiveBlueprintResponse,
+    AdaptiveRoadmapRequest,
+    AdaptiveRoadmapResponse,
     ValidateJdRequest,
     ValidateJdResponse,
 )
@@ -81,6 +91,8 @@ from services.question_assist_service import QuestionAssistService
 from services.question_generation_service import QuestionGenerationService
 from services.rag_ingest_service import RagIngestService
 from services.recommend_interview_configuration_service import RecommendInterviewConfigurationService
+from services.roadmap_recommendation_service import RoadmapRecommendationService
+from services.adaptive_competency_service import AdaptiveCompetencyService
 from services.rag_error_helpers import build_rag_error_detail
 
 router = APIRouter(
@@ -406,6 +418,54 @@ def candidate_generate_questions_from_plan(
     service: CandidateQuestionGenerationService = Depends(get_candidate_question_service),
 ) -> GenerateQuestionsFromPlanResponse:
     return service.generate_from_plan(request)
+
+
+@router.post(
+    "/candidate/roadmap-recommendation",
+    response_model=RoadmapRecommendResponse,
+    response_model_exclude_none=True,
+)
+def candidate_roadmap_recommendation(
+    request: RoadmapRecommendRequest,
+    service: RoadmapRecommendationService = Depends(get_roadmap_recommendation_service),
+) -> RoadmapRecommendResponse:
+    return service.recommend(request)
+
+
+@router.post(
+    "/candidate/retrieve-competency-context",
+    response_model=CompetencyContextResponse,
+    response_model_exclude_none=True,
+)
+def candidate_retrieve_competency_context(
+    request: CompetencyContextRequest,
+    service: AdaptiveCompetencyService = Depends(get_adaptive_competency_service),
+) -> CompetencyContextResponse:
+    return service.retrieve_context(request)
+
+
+@router.post(
+    "/candidate/generate-adaptive-competency-blueprint",
+    response_model=AdaptiveBlueprintResponse,
+    response_model_exclude_none=True,
+)
+def candidate_generate_adaptive_blueprint(
+    request: AdaptiveBlueprintRequest,
+    service: AdaptiveCompetencyService = Depends(get_adaptive_competency_service),
+) -> AdaptiveBlueprintResponse:
+    return service.generate_blueprint(request)
+
+
+@router.post(
+    "/candidate/generate-adaptive-roadmap",
+    response_model=AdaptiveRoadmapResponse,
+    response_model_exclude_none=True,
+)
+def candidate_generate_adaptive_roadmap(
+    request: AdaptiveRoadmapRequest,
+    service: AdaptiveCompetencyService = Depends(get_adaptive_competency_service),
+) -> AdaptiveRoadmapResponse:
+    return service.generate_roadmap(request)
 
 
 @router.post(

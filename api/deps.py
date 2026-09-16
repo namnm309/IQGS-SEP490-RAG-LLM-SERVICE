@@ -17,9 +17,11 @@ from services.async_ingest_service import AsyncIngestService
 from services.backend_callback_client import BackendCallbackClient
 from services.chunking_service import ChunkingService
 from services.cv_parse_service import CvParseService
+from services.document_classify import DocumentClassifyService
 from services.document_downloader import DocumentDownloader
 from services.document_parser import DocumentParser
 from services.embedding_service import EmbeddingService
+from services.jsonl_qa_chunker import JsonlQaChunker
 from services.plan_generation_service import PlanGenerationService
 from services.plan_refine_service import PlanRefineService
 from services.candidate_plan_generation_service import CandidatePlanGenerationService
@@ -30,10 +32,12 @@ from services.evaluate_question_set_service import EvaluateQuestionSetService
 from services.practice_session_insight_service import PracticeSessionInsightService
 from services.question_generation_service import QuestionGenerationService
 from services.rag_ingest_service import RagIngestService
+from services.rag_retrieval_service import RagRetrievalService
 from services.jd_analyze_service import JdAnalyzeService
 from services.jd_parse_service import JdParseService
-from services.rag_retrieval_service import RagRetrievalService
 from services.recommend_interview_configuration_service import RecommendInterviewConfigurationService
+from services.roadmap_recommendation_service import RoadmapRecommendationService
+from services.adaptive_competency_service import AdaptiveCompetencyService
 from vectorstores.pgvector_store import PgVectorStore
 
 logger = logging.getLogger(__name__)
@@ -62,6 +66,8 @@ _evaluate_question_set_service: EvaluateQuestionSetService | None = None
 _practice_session_insight_service: PracticeSessionInsightService | None = None
 _retrieval_service: RagRetrievalService | None = None
 _embedding_service: EmbeddingService | None = None
+_roadmap_recommendation_service: RoadmapRecommendationService | None = None
+_adaptive_competency_service: AdaptiveCompetencyService | None = None
 _settings_ref: Settings | None = None
 
 
@@ -124,6 +130,10 @@ def _wire_chat_client(client: OpenAI) -> None:
         _jd_analyze_service._client = client  # noqa: SLF001
     if _recommend_configuration_service is not None:
         _recommend_configuration_service._client = client  # noqa: SLF001
+    if _roadmap_recommendation_service is not None:
+        _roadmap_recommendation_service._client = client  # noqa: SLF001
+    if _adaptive_competency_service is not None:
+        _adaptive_competency_service._client = client  # noqa: SLF001
 
 
 def _wire_embed_client(client: OpenAI) -> None:
@@ -184,6 +194,7 @@ def startup() -> None:
     global _question_assist_service, _evaluate_answer_service, _evaluate_question_set_service
     global _practice_session_insight_service
     global _retrieval_service, _embedding_service, _settings_ref
+    global _roadmap_recommendation_service, _adaptive_competency_service
 
     settings = get_settings()
     # Đồng bộ mặc định chat ← ollama nếu chưa set env riêng
@@ -208,7 +219,9 @@ def startup() -> None:
     downloader = DocumentDownloader(settings)
     parser = DocumentParser()
     chunking = ChunkingService(settings)
+    jsonl_chunker = JsonlQaChunker()
     _retrieval_service = RagRetrievalService(_vector_store, _embedding_service, settings)
+    _doc_classifier = DocumentClassifyService(_chat_client, settings)
 
     _ingest_service = RagIngestService(
         vector_store=_vector_store,
@@ -217,6 +230,8 @@ def startup() -> None:
         chunking=chunking,
         embedding=_embedding_service,
         callback_client=callback_client,
+        jsonl_chunker=jsonl_chunker,
+        classifier=_doc_classifier,
     )
     _question_service = QuestionGenerationService(
         retrieval=_retrieval_service,
@@ -263,6 +278,16 @@ def startup() -> None:
     _practice_session_insight_service = PracticeSessionInsightService(
         client=_chat_client, settings=settings
     )
+    _roadmap_recommendation_service = RoadmapRecommendationService(
+        retrieval=_retrieval_service,
+        client=_chat_client,
+        settings=settings,
+    )
+    _adaptive_competency_service = AdaptiveCompetencyService(
+        retrieval=_retrieval_service,
+        client=_chat_client,
+        settings=settings,
+    )
 
 
 def shutdown() -> None:
@@ -272,7 +297,8 @@ def shutdown() -> None:
     global _jd_parse_service, _jd_analyze_service, _recommend_configuration_service, _cv_parse_service, _async_generation_service, _async_ingest_service
     global _question_assist_service, _evaluate_answer_service, _evaluate_question_set_service
     global _practice_session_insight_service
-    global _retrieval_service, _embedding_service, _settings_ref
+    global _retrieval_service, _embedding_service, _settings_ref, _roadmap_recommendation_service
+    global _adaptive_competency_service
 
     if _pool is not None:
         _pool.close()
@@ -299,6 +325,8 @@ def shutdown() -> None:
     _practice_session_insight_service = None
     _retrieval_service = None
     _embedding_service = None
+    _roadmap_recommendation_service = None
+    _adaptive_competency_service = None
     _settings_ref = None
     clear_runtime_cache()
 
@@ -474,6 +502,26 @@ def get_evaluate_answer_service() -> EvaluateAnswerService:
     except Exception:
         pass
     return _evaluate_answer_service
+
+
+def get_roadmap_recommendation_service() -> RoadmapRecommendationService:
+    if _roadmap_recommendation_service is None:
+        raise RuntimeError("Roadmap recommendation service chưa được khởi tạo")
+    try:
+        refresh_runtime_config(force=False)
+    except Exception:
+        pass
+    return _roadmap_recommendation_service
+
+
+def get_adaptive_competency_service() -> AdaptiveCompetencyService:
+    if _adaptive_competency_service is None:
+        raise RuntimeError("Adaptive competency service chưa được khởi tạo")
+    try:
+        refresh_runtime_config(force=False)
+    except Exception:
+        pass
+    return _adaptive_competency_service
 
 
 def get_evaluate_question_set_service() -> EvaluateQuestionSetService:

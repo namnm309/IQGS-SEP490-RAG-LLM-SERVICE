@@ -85,6 +85,13 @@ class IngestRequest(BaseModel):
     source_url: str | None = Field(default=None, alias="sourceUrl")
     section: str | None = None
     year: int | None = None
+    document_type: str | None = Field(default=None, alias="documentType")
+    source_version: str | None = Field(default=None, alias="sourceVersion")
+    role_key: str | None = Field(default=None, alias="roleKey")
+    technology: str | None = None
+    level: str | None = None
+    skill: str | None = None
+    topic: str | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -533,6 +540,8 @@ class GenerateQuestionsFromPlanResponse(BaseModel):
     questions: list[GeneratedQuestionItem] = Field(default_factory=list)
     processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
     error: str | None = None
+    # Coach: system = có chunk SYSTEM; inferred = thiếu KB, LLM sinh theo blueprint/CV.
+    kb_source: str | None = Field(default=None, alias="kbSource")
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
@@ -705,12 +714,18 @@ class RecommendInterviewConfigurationResponse(BaseModel):
 
 
 class ParseCvResponse(BaseModel):
-    """Kết quả parse CV (SCRUM-300) — khớp ParseCvResult phía Backend .NET."""
+    """Kết quả parse CV (SCRUM-300 / SCRUM-447 / SCRUM-466) — khớp ParseCvResult phía Backend .NET."""
 
     success: bool
     skills: list[str] = Field(default_factory=list)
     summary: str | None = None
     file_name: str | None = Field(default=None, alias="fileName")
+    suggested_role: str | None = Field(default=None, alias="suggestedRole")
+    years_of_experience_hint: float | None = Field(default=None, alias="yearsOfExperienceHint")
+    # SCRUM-466: classify IT resume trong cùng lần parse
+    document_type: str | None = Field(default=None, alias="documentType")
+    is_it_role: bool | None = Field(default=None, alias="isItRole")
+    reject_reason: str | None = Field(default=None, alias="rejectReason")
     warnings: list[str] = Field(default_factory=list)
     error: str | None = None
     detail: str | None = None
@@ -781,6 +796,8 @@ class EvaluateAnswerRequest(BaseModel):
     jd_context: str | None = Field(default=None, alias="jdContext")
     skill: str | None = None
     question_type: str | None = Field(default=None, alias="questionType")
+    # SCRUM-447: marketplace (default) | coach
+    scoring_mode: str | None = Field(default=None, alias="scoringMode")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -919,5 +936,160 @@ class EvaluateQuestionSetResponse(BaseModel):
     processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
     error: str | None = None
     detail: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class RoadmapWeakSkillDto(BaseModel):
+    skill: str
+    current_score: float = Field(default=0, alias="currentScore")
+    target_score: float = Field(default=0, alias="targetScore")
+    gap: float = 0
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RoadmapCandidateNodeDto(BaseModel):
+    topic: str
+    subtopic: str | None = None
+    skill: str = ""
+    importance: float = 0
+    prerequisites: list[str] = Field(default_factory=list)
+    next_topics: list[str] = Field(default_factory=list, alias="nextTopics")
+    source_title: str | None = Field(default=None, alias="sourceTitle")
+    source_url: str | None = Field(default=None, alias="sourceUrl")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RoadmapRecommendRequest(BaseModel):
+    """SCRUM-455: LLM chỉ chọn/sắp topic trong tập retrieved — không đổi score/level."""
+
+    target_role: str = Field(default="", alias="targetRole")
+    target_level: str = Field(default="", alias="targetLevel")
+    weak_skills: list[RoadmapWeakSkillDto] = Field(default_factory=list, alias="weakSkills")
+    candidate_nodes: list[RoadmapCandidateNodeDto] = Field(
+        default_factory=list, alias="candidateNodes"
+    )
+    role_key: str | None = Field(default=None, alias="roleKey")
+    # Folder coach-roadmap: chỉ retrieve các documentIds này (không quét full SYSTEM).
+    document_ids: list[str] = Field(default_factory=list, alias="documentIds")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class RoadmapTopicPickDto(BaseModel):
+    topic: str
+    reason: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class RoadmapRecommendResponse(BaseModel):
+    success: bool
+    topics: list[RoadmapTopicPickDto] = Field(default_factory=list)
+    explanation: str | None = None
+    error: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class CompetencyContextRequest(BaseModel):
+    target_role: str = Field(default="", alias="targetRole")
+    target_level: str = Field(default="", alias="targetLevel")
+    role_family_key: str | None = Field(default=None, alias="roleFamilyKey")
+    skills: list[str] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CompetencyContextChunkDto(BaseModel):
+    source_title: str | None = Field(default=None, alias="sourceTitle")
+    source_url: str | None = Field(default=None, alias="sourceUrl")
+    document_id: str | None = Field(default=None, alias="documentId")
+    section: str | None = None
+    document_type: str | None = Field(default=None, alias="documentType")
+    content: str = ""
+    score: float = 0
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class CompetencyContextResponse(BaseModel):
+    success: bool
+    chunks: list[CompetencyContextChunkDto] = Field(default_factory=list)
+    error: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class AdaptiveCitationDto(BaseModel):
+    source_title: str | None = Field(default=None, alias="sourceTitle")
+    source_url: str | None = Field(default=None, alias="sourceUrl")
+    section: str | None = None
+    document_id: str | None = Field(default=None, alias="documentId")
+    excerpt: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class AdaptiveCompetencyDto(BaseModel):
+    skill_key: str = Field(default="", alias="skillKey")
+    skill_name: str = Field(default="", alias="skillName")
+    category: str = "ROLE_CORE"
+    weight: float = 0
+    topics: list[str] = Field(default_factory=list)
+    citations: list[AdaptiveCitationDto] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class AdaptiveBlueprintRequest(BaseModel):
+    target_role: str = Field(default="", alias="targetRole")
+    target_level: str = Field(default="", alias="targetLevel")
+    role_family_key: str | None = Field(default=None, alias="roleFamilyKey")
+    cv_skills: list[str] = Field(default_factory=list, alias="cvSkills")
+    chunks: list[CompetencyContextChunkDto] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdaptiveBlueprintResponse(BaseModel):
+    success: bool
+    competencies: list[AdaptiveCompetencyDto] = Field(default_factory=list)
+    error: str | None = None
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class AdaptiveRoadmapRequest(BaseModel):
+    target_role: str = Field(default="", alias="targetRole")
+    target_level: str = Field(default="", alias="targetLevel")
+    skill: str = ""
+    current_score: float = Field(default=0, alias="currentScore")
+    target_score: float = Field(default=0, alias="targetScore")
+    gap: float = 0
+    blueprint_topics: list[str] = Field(default_factory=list, alias="blueprintTopics")
+    chunks: list[CompetencyContextChunkDto] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AdaptiveRoadmapTopicDto(BaseModel):
+    topic: str
+    subtopic: str | None = None
+    source_title: str | None = Field(default=None, alias="sourceTitle")
+    source_url: str | None = Field(default=None, alias="sourceUrl")
+    section: str | None = None
+    document_id: str | None = Field(default=None, alias="documentId")
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class AdaptiveRoadmapResponse(BaseModel):
+    success: bool
+    topics: list[AdaptiveRoadmapTopicDto] = Field(default_factory=list)
+    explanation: str | None = None
+    error: str | None = None
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
