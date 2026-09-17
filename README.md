@@ -45,7 +45,7 @@ IQGS RAG Service là microservice Python chuyên xử lý pipeline **Retrieval-A
 
 | Chức năng | Mô tả |
 |-----------|--------|
-| **Knowledge ingest** | Tải file PDF/DOCX/TXT từ Azure Blob → chunk → embed → lưu `knowledge_chunks` |
+| **Knowledge ingest** | Tải file PDF/DOCX/TXT (và **`.jsonl` Q/A cho Admin SYSTEM** — SCRUM-448) từ Azure Blob → chunk → embed → lưu `knowledge_chunks` |
 | **Vector retrieval** | Tìm kiếm cosine similarity theo scope SYSTEM (toàn hệ thống) và HR (theo owner) |
 | **Interview plan** | Retrieve context + LLM sinh kế hoạch phỏng vấn JSON |
 | **Question generation** | Retrieve context + LLM sinh câu hỏi theo approved plan |
@@ -206,7 +206,8 @@ RAG/
 │   ├── backend_callback_client.py  # PATCH status/generation-result về BE
 │   ├── embedding_service.py        # Ollama batch embedding
 │   ├── chunking_service.py         # Wrapper text chunker
-│   ├── document_parser.py          # PDF/DOCX/TXT parser
+│   ├── document_parser.py          # PDF/DOCX/TXT (+ nhận .jsonl)
+│   ├── jsonl_qa_chunker.py         # SCRUM-448: JSONL Q/A → 1 record = 1 chunk
 │   ├── document_downloader.py        # Download blob qua SAS URL
 │   ├── json_output_parser.py       # Parse LLM JSON output
 │   ├── rag_context_helpers.py      # Format context [HỆ THỐNG]/[HR], citations
@@ -378,11 +379,12 @@ sequenceDiagram
 1. Validate `scope` + `ownerId` (HR bắt buộc có owner)
 2. Callback `PROCESSING` về Backend
 3. `DocumentDownloader` tải file qua SAS URL (timeout `REQUEST_TIMEOUT_SECONDS`)
-4. `DocumentParser` trích text từ PDF/DOCX/TXT
-5. `ChunkingService` chia recursive (size/overlap từ config)
-6. `EmbeddingService` embed batch qua Ollama OpenAI-compatible API
-7. `PgVectorStore.upsert_chunks_batched` — xóa chunks cũ của `document_id`, insert mới
-8. Callback `COMPLETED` (+ `chunkCount`) hoặc `FAILED` (+ `errorMessage`)
+4. **Định dạng:**
+   - PDF/DOCX/TXT → `DocumentParser` + `ChunkingService` (recursive split)
+   - **`.jsonl` (SCRUM-448)** → `JsonlQaChunker`: mỗi dòng `{"question","answer"}` = **1 chunk** (`Question:` / `Answer:`), metadata `recordKind=qa`, `repo` = stem filename (trừ `default`)
+5. `EmbeddingService` embed batch qua Ollama OpenAI-compatible API
+6. `PgVectorStore.upsert_chunks_batched` — xóa chunks cũ của `document_id`, insert mới
+7. Callback `COMPLETED` (+ `chunkCount`) hoặc `FAILED` (+ `errorMessage`)
 
 ---
 

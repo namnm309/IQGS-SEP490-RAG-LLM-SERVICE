@@ -86,6 +86,7 @@ def test_candidate_prompt_is_not_hr_prompt() -> None:
 
 
 def test_candidate_generate_from_plan_zero_chunks(settings: Settings) -> None:
+    """jd_practice vẫn được sinh khi thiếu chunk; coach thì không (xem test SCRUM-458)."""
     client = MagicMock()
     choice = MagicMock()
     choice.message.content = _valid_questions_json(1)
@@ -102,7 +103,7 @@ def test_candidate_generate_from_plan_zero_chunks(settings: Settings) -> None:
         ownerId="11111111-1111-1111-1111-111111111111",
         jobDescription="unused",
         cvContext="Skills: C#",
-        audience="coach",
+        audience="jd_practice",
         approvedPlan=_approved_plan(1),
     )
     result = service.generate_from_plan(request)
@@ -113,3 +114,77 @@ def test_candidate_generate_from_plan_zero_chunks(settings: Settings) -> None:
     messages = client.chat.completions.create.call_args.kwargs["messages"]
     assert "JD là nguồn CHÍNH" not in messages[0]["content"]
     assert "ỨNG VIÊN" in messages[0]["content"] or "ứng viên" in messages[0]["content"].lower()
+
+
+def test_coach_generate_from_plan_empty_retrieval_inferred(settings: Settings) -> None:
+    """Coach thiếu KB vẫn sinh LLM và gắn kbSource=inferred."""
+    client = MagicMock()
+    choice = MagicMock()
+    choice.message.content = _valid_questions_json(1)
+    client.chat.completions.create.return_value = MagicMock(choices=[choice])
+
+    retrieval = MagicMock()
+    retrieval.retrieve_system_only.return_value = []
+
+    service = CandidateQuestionGenerationService(
+        retrieval=retrieval, client=client, settings=settings
+    )
+    request = CandidateGenerateQuestionsFromPlanRequest(
+        ownerId="11111111-1111-1111-1111-111111111111",
+        jobDescription="Coach diagnostic",
+        audience="coach",
+        approvedPlan=_approved_plan(1),
+    )
+    result = service.generate_from_plan(request)
+    assert result.success is True
+    assert len(result.questions) == 1
+    assert result.kb_source == "inferred"
+    client.chat.completions.create.assert_called_once()
+    user_msg = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "Thiếu chunk SYSTEM" in user_msg
+    assert "suy luận" in user_msg.lower() or "inferred" in user_msg.lower()
+    # Query extra phải mang skill/topic từ outline
+    call_kwargs = retrieval.retrieve_system_only.call_args.kwargs
+    extra = call_kwargs.get("query_extra") or ""
+    assert "C#" in extra or "DI" in extra
+
+
+def test_coach_generate_from_plan_with_chunks_grounds_prompt(settings: Settings) -> None:
+    """Có chunk thì LLM được gọi, prompt bám SYSTEM, kbSource=system."""
+    from vectorstores.base import RetrievedChunk
+
+    client = MagicMock()
+    choice = MagicMock()
+    choice.message.content = _valid_questions_json(1)
+    client.chat.completions.create.return_value = MagicMock(choices=[choice])
+
+    chunk = RetrievedChunk(
+        document_id="doc-tech",
+        chunk_index=0,
+        content="Dependency Injection trong ASP.NET Core.",
+        scope="SYSTEM",
+        owner_id=None,
+        score=0.91,
+        metadata={"fileName": "dotnet.md", "documentType": "InternalStack"},
+    )
+    retrieval = MagicMock()
+    retrieval.retrieve_system_only.return_value = [chunk]
+
+    service = CandidateQuestionGenerationService(
+        retrieval=retrieval, client=client, settings=settings
+    )
+    request = CandidateGenerateQuestionsFromPlanRequest(
+        ownerId="11111111-1111-1111-1111-111111111111",
+        jobDescription="Coach diagnostic",
+        audience="coach",
+        approvedPlan=_approved_plan(1),
+    )
+    result = service.generate_from_plan(request)
+    assert result.success is True
+    assert len(result.questions) == 1
+    assert result.kb_source == "system"
+    user_msg = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "ĐÚNG 1 câu" in user_msg
+    assert "chunk SYSTEM" in user_msg.lower() or "bám chunk" in user_msg.lower()
+    assert "Thiếu chunk SYSTEM — sinh từ blueprint/CV" not in user_msg
+    assert "Dependency Injection" in user_msg or "HỆ THỐNG" in user_msg

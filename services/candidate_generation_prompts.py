@@ -69,15 +69,19 @@ audience=jd_practice: luyện theo JD mục tiêu + gap trong note.
 4. sample_answer: đáp án chuẩn mực 4–8 câu, đúng kiến thức, không lan man.
 5. {language_rule}
 6. Chỉ JSON hợp lệ, không markdown ngoài JSON. Không image_hint. answer_method mặc định Text.
-7. [HỆ THỐNG] có thể trống — vẫn sinh đủ câu từ plan + cvContext + note.
+7. [HỆ THỐNG] có thể trống — vẫn sinh đủ câu từ plan + cvContext + note (audience=coach: đánh dấu suy luận).
 
 ## Số lượng & độ khó (audience=coach — BẮT BUỘC)
-- Tối thiểu 10 câu. Nếu approvedPlan.totalQuestions < 10 thì vẫn sinh ĐÚNG 10 câu; nếu ≥ 10 thì đúng totalQuestions.
-- Độ khó TĂNG DẦN theo order:
-  • khoảng 30% đầu: easy (khái niệm, định nghĩa, khi nào dùng)
-  • khoảng 40% giữa: medium (so sánh, vận dụng, trade-off)
-  • khoảng 30% cuối: hard (tình huống, debug, thiết kế, edge case)
-- Không để toàn bộ medium. order=1 phải easy hơn order cuối.
+- Sinh ĐÚNG số câu = approvedPlan.totalQuestions (không ép tối thiểu 10; blueprint framework có thể ít hơn).
+- Nếu thiếu totalQuestions hợp lệ thì mặc định 10.
+- approvedPlan.recommendedQuestionOutline là hợp đồng: MỖI dòng outline = 1 câu hỏi.
+  Giữ NGUYÊN order, skill, difficulty và topic/focus_area của dòng đó — Backend dùng đúng
+  skill + difficulty này để tính điểm năng lực, nên không được tự đổi hay gộp.
+- Không thêm skill ngoài approvedPlan.skills. Không tự nâng/hạ độ khó của một dòng.
+- Độ khó của cả đề đã được sắp tăng dần trong outline (thường ~30% easy, ~40% medium, ~30% hard):
+  • easy: khái niệm, định nghĩa, khi nào dùng
+  • medium: so sánh, vận dụng, trade-off
+  • hard: tình huống, debug, thiết kế, edge case
 
 ## Schema JSON bắt buộc
 {{
