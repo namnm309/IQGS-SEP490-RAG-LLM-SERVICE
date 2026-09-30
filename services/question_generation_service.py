@@ -12,6 +12,8 @@ from openai import OpenAI
 
 from config.settings import Settings
 from models.internal_schemas import (
+    VALID_QUESTION_TYPES,
+    FlaggedQuestionItem,
     GeneratedQuestionItem,
     GenerateQuestionsFromPlanRequest,
     GenerateQuestionsFromPlanResponse,
@@ -19,6 +21,7 @@ from models.internal_schemas import (
     GenerateQuestionsResponse,
     QuestionGenerationPlan,
     RubricCriterionItem,
+    normalize_question_type,
 )
 from services.json_output_parser import (
     build_json_fix_prompt,
@@ -38,9 +41,18 @@ from services.rag_retrieval_service import RagRetrievalService
 from services.question_provenance_validator import apply_provenance_to_questions
 from services.rag_context_helpers import is_jd_source_file
 from vectorstores.base import RetrievedChunk
-from helpers.language_prompt import free_text_language_label, language_instruction_block
+from helpers.language_prompt import (
+    free_text_language_label,
+    language_instruction_block,
+    normalize_output_language,
+)
 
 logger = logging.getLogger(__name__)
+
+# SCRUM-495 harden: retry sinh lại khi lệch config HR
+_LABEL_MISMATCH_MAX_RETRIES = 3
+_DISTRIBUTION_FIX_MAX_ROUNDS = 2
+
 _DEFAULT_CODE_TEMPLATES = [
     "CODE_COMPLETION",
     "BUG_DETECTION",
@@ -880,6 +892,12 @@ class QuestionGenerationService:
                 processing_time_ms=(time.time() - start) * 1000,
             )
 
+        # HG01/HG02: ép type outline khớp phân bổ HR TRƯỚC khi dựng prompt — slot đổi nhóm type được
+        # đổi cả skill + goal, để LLM nhận outline nhất quán ngay từ đầu (không sinh xong mới đổi nhãn).
+        _reconcile_outline_types_to_distribution(
+            request.approved_plan, language=request.language, rewrite_slots=True
+        )
+
         try:
             query_extra = _build_plan_retrieve_query(
                 request.approved_plan, request.hr_note
@@ -925,17 +943,31 @@ class QuestionGenerationService:
                 request, system_chunks, hr_chunks, all_chunks
             )
 
-        questions = apply_provenance_to_questions(
-            questions,
-            chunks=all_chunks,
-            job_description=request.job_description,
-        )
+        flagged: list[FlaggedQuestionItem] = []
+        distribution_match: bool | None = None
+        if questions:
+            questions, flagged, distribution_match = self._align_flag_and_regen_from_plan(
+                questions,
+                request,
+                system_chunks,
+                hr_chunks,
+                all_chunks,
+            )
+        else:
+            questions = apply_provenance_to_questions(
+                questions,
+                chunks=all_chunks,
+                job_description=request.job_description,
+            )
 
+        # SCRUM-495: flagged ≠ fail — vẫn success để BE lưu bộ; FE cảnh báo nhẹ qua needsReview
         return GenerateQuestionsFromPlanResponse(
             success=parse_error is None and len(questions) > 0,
             questions=questions,
             processing_time_ms=(time.time() - start) * 1000,
             error=parse_error,
+            flagged_questions=flagged,
+            distribution_match=distribution_match,
         )
 
     def _generate_from_plan_single(
@@ -976,6 +1008,7 @@ class QuestionGenerationService:
             request.job_description,
             request.hr_note,
             expected_count=batch_count,
+            language=request.language,
         )
 
         if parse_error and is_retryable_json_error(parse_error):
@@ -990,6 +1023,7 @@ class QuestionGenerationService:
                     request.job_description,
                     request.hr_note,
                     expected_count=batch_count,
+                    language=request.language,
                 ),
                 timeout=timeout,
             )
@@ -1042,18 +1076,29 @@ class QuestionGenerationService:
         if not merged:
             return [], errors[0] if errors else "Không sinh được câu hỏi nào."
 
-        # Re-number + validate total (nới lỏng)
+        # Re-number + validate total (nới lỏng số lượng; phân bổ xử lý ở align/flag)
         merged.sort(key=lambda q: q.order if q.order is not None else 0)
         for i, q in enumerate(merged, start=1):
             q.order = i
 
+        # SCRUM-495 harden: reconcile + khóa type theo HR distribution
+        _reconcile_outline_types_to_distribution(
+            request.approved_plan, language=request.language, rewrite_slots=True
+        )
+        self._lock_questions_to_outline(merged, request.approved_plan)
+        _apply_distribution_types_when_no_outline(merged, request.approved_plan)
+
         validation_error = _validate_questions_against_plan(
-            merged, request.approved_plan, strict_count=False
+            merged,
+            request.approved_plan,
+            strict_count=False,
+            enforce_distribution=False,
         )
         if validation_error and len(merged) < max(1, (total * 2) // 3):
             return merged, validation_error
         if validation_error:
-            logger.warning("Plan validation soft-accept: %s", validation_error)
+            # Chỉ soft-accept thiếu/thừa nhẹ tổng số — không nuốt lệch phân bổ im lặng
+            logger.warning("Plan validation soft-accept (count only): %s", validation_error)
         return merged, None
 
     def _call_llm(self, messages: list[dict[str, str]], *, timeout: float | None = None) -> str:
@@ -1161,7 +1206,14 @@ class QuestionGenerationService:
         order_end: int | None = None,
         batch_count: int | None = None,
     ) -> str:
-        plan_json = request.approved_plan.model_dump(by_alias=True, mode="json")
+        # HG01: plannedSkill/relabeled là dấu nội bộ BE — không đưa vào prompt cho LLM đỡ nhiễu
+        plan_json = request.approved_plan.model_dump(
+            by_alias=True,
+            mode="json",
+            exclude={
+                "recommended_question_outline": {"__all__": {"planned_skill", "relabeled"}}
+            },
+        )
         target = batch_count or request.approved_plan.total_questions
 
         lines = [
@@ -1177,13 +1229,23 @@ class QuestionGenerationService:
                     "STRICT_FOCUS: Chỉ sinh câu hỏi bám coverage/outline/FOCUS_AREAS. "
                     "Không hỏi skill khác dù JD còn đề cập. JD chỉ dùng cho citation why-asked."
                 )
-            # SCRUM-429: Studio regen — tránh trùng câu khác trong cùng plan
+            # SCRUM-429 / SCRUM-496: Studio regen — tránh trùng; ưu tiên HR_REGEN_NOTE nếu có
             if "STUDIO_REGEN=1" in request.hr_note or "AVOID_QUESTIONS=" in request.hr_note:
-                lines.append(
-                    "STUDIO_REGEN / AVOID_QUESTIONS: Câu mới PHẢI khác ý và cấu trúc các mục "
-                    "trong AVOID_QUESTIONS (phân tách |#|). Không paraphrase gần như giống; "
-                    "đổi góc hỏi / ví dụ / yêu cầu cụ thể trong khi vẫn bám skill/focus/goal của outline."
-                )
+                if "HR_REGEN_NOTE=" in request.hr_note:
+                    lines.append(
+                        "HR_REGEN_NOTE (ưu tiên): Làm theo lưu ý HR (góc hỏi, độ khó, format, "
+                        "nhấn mạnh chủ đề…). Vẫn giữ ngữ cảnh skill/focus/goal của outline + JD "
+                        "— KHÔNG đổi skill/focus label của slot. "
+                        "STUDIO_REGEN / AVOID_QUESTIONS: Câu mới PHẢI khác hẳn ý và cấu trúc các mục "
+                        "trong AVOID_QUESTIONS (phân tách |#|, mục đầu thường là câu đang regen). "
+                        "Không paraphrase / viết lại gần giống câu cũ."
+                    )
+                else:
+                    lines.append(
+                        "STUDIO_REGEN / AVOID_QUESTIONS: Câu mới PHẢI khác ý và cấu trúc các mục "
+                        "trong AVOID_QUESTIONS (phân tách |#|). Không paraphrase gần như giống; "
+                        "đổi góc hỏi / ví dụ / yêu cầu cụ thể trong khi vẫn bám skill/focus/goal của outline."
+                    )
         mode, templates = _parse_content_preferences(request.hr_note)
         lines.append(f"contentMode: {mode}")
         lines.append(f"enabledCodeTemplates: {', '.join(templates)}")
@@ -1216,6 +1278,8 @@ class QuestionGenerationService:
             "Nếu approvedPlan.recommendedQuestionOutline[i].citations đã khóa — "
             "BẮT BUỘC bám skill/focus/goal của slot đó; không đổi why-asked JD chunk đã khóa. "
             "rationale PHẢI trùng outline[i].goal (đã khóa ở Live Preview) — không viết lại lý do khác. "
+            "HG01: mỗi câu giữ đúng order của slot và ghi skill y hệt skill của slot đó; nội dung câu "
+            "phải hỏi đúng skill + goal của slot, không viết nội dung của slot khác dưới order này. "
             "Citation chunk phải khớp source_file/chunk_index trong context.",
             "Không chèn backslash lạ trong string (dùng \\\\ nếu cần ký tự \\).",
             f"Toàn bộ content câu hỏi/rationale/sample_answer/evaluation_criteria bằng "
@@ -1289,6 +1353,8 @@ class QuestionGenerationService:
                     answer_method=_normalize_answer_method(
                         item.get("answer_method", item.get("answerMethod"))
                     ),
+                    # HG01: skill LLM tự ghi, giữ trước khi khoá theo slot
+                    llm_skill_echo=skill_val,
                 )
             )
 
@@ -1450,6 +1516,7 @@ class QuestionGenerationService:
         hr_note: str | None = None,
         *,
         expected_count: int | None = None,
+        language: str | None = None,
     ) -> tuple[list[GeneratedQuestionItem], str | None]:
         questions, parse_error = self._parse_questions(
             raw, chunk_lookup, job_description, hr_note
@@ -1462,8 +1529,15 @@ class QuestionGenerationService:
         if isinstance(data, dict):
             items = data.get("questions", [])
             if isinstance(items, list):
-                for i, item in enumerate(items):
-                    if i >= len(questions) or not isinstance(item, dict):
+                # HG01: _parse_questions đã bỏ item hỏng / câu rỗng — phải lọc y hệt rồi mới ghép theo
+                # index; nếu không, 1 câu rỗng là các câu sau nhận order (→ nhãn) của slot khác.
+                valid_items = [
+                    it
+                    for it in items
+                    if isinstance(it, dict) and str(it.get("question", "")).strip()
+                ]
+                for i, item in enumerate(valid_items):
+                    if i >= len(questions):
                         continue
                     q = questions[i]
                     order_val = item.get("order")
@@ -1493,35 +1567,10 @@ class QuestionGenerationService:
                     if hint_val:
                         q.image_hint = str(hint_val).strip()
 
-        # Gán order / skill / focus / answerMethod từ outline nếu LLM thiếu
-        if approved_plan.recommended_question_outline:
-            outline_by_order = {
-                o.order: o for o in approved_plan.recommended_question_outline
-            }
-            for idx, q in enumerate(questions):
-                outline = None
-                if q.order is None and idx < len(
-                    approved_plan.recommended_question_outline
-                ):
-                    outline = approved_plan.recommended_question_outline[idx]
-                    q.order = outline.order
-                elif q.order is not None and q.order in outline_by_order:
-                    outline = outline_by_order[q.order]
-                if outline is None:
-                    continue
-                if not q.skill:
-                    q.skill = outline.skill
-                if not q.focus_area:
-                    q.focus_area = outline.focus_area
-                # HR preview: ưu tiên answerMethod trên outline.
-                # Text = cách trả lời — KHÔNG xóa code_snippet đề nếu template code-heavy.
-                preferred = _normalize_answer_method(
-                    getattr(outline, "answer_method", None)
-                )
-                _apply_outline_answer_method(q, preferred)
-
-        # SCRUM-427: rationale khóa = outline.goal
-        self._seed_rationale_from_outline(questions, approved_plan)
+        # SCRUM-495 harden: reconcile type outline → distribution HR, rồi khóa metadata
+        _reconcile_outline_types_to_distribution(approved_plan, language=language)
+        self._lock_questions_to_outline(questions, approved_plan)
+        _apply_distribution_types_when_no_outline(questions, approved_plan)
 
         # SCRUM-426: copy citations đã khóa từ outline → câu hỏi
         self._seed_citations_from_outline(questions, approved_plan)
@@ -1537,12 +1586,944 @@ class QuestionGenerationService:
             approved_plan,
             expected_count=expected_count,
             strict_count=expected_count is None,
+            enforce_distribution=False,
         )
         mode, _ = _parse_content_preferences(hr_note)
         for q in questions:
             _align_code_to_question(q, mode)
             _ensure_code_heavy_has_snippet(q)
         return questions, validation_error
+
+    @staticmethod
+    def _lock_questions_to_outline(
+        questions: list[GeneratedQuestionItem],
+        approved_plan: QuestionGenerationPlan,
+    ) -> None:
+        """SCRUM-495: metadata bám outline HR — type/skill/focus/rationale(=goal)."""
+        outline_list = approved_plan.recommended_question_outline or []
+        if not outline_list:
+            return
+        outline_by_order = {o.order: o for o in outline_list}
+        for idx, q in enumerate(questions):
+            outline = None
+            if q.order is not None and q.order in outline_by_order:
+                outline = outline_by_order[q.order]
+            elif idx < len(outline_list):
+                outline = outline_list[idx]
+                if q.order is None:
+                    q.order = outline.order
+            if outline is None:
+                continue
+            q.question_type = _safe_normalize_question_type(outline.type)
+            if (outline.skill or "").strip():
+                q.skill = outline.skill.strip()
+            if (outline.focus_area or "").strip():
+                q.focus_area = outline.focus_area.strip()
+            goal = (outline.goal or "").strip()
+            if goal:
+                q.rationale = goal
+            preferred = _normalize_answer_method(
+                getattr(outline, "answer_method", None)
+            )
+            _apply_outline_answer_method(q, preferred)
+
+    def _align_flag_and_regen_from_plan(
+        self,
+        questions: list[GeneratedQuestionItem],
+        request: GenerateQuestionsFromPlanRequest,
+        system_chunks: list[RetrievedChunk],
+        hr_chunks: list[RetrievedChunk],
+        all_chunks: list[RetrievedChunk],
+    ) -> tuple[list[GeneratedQuestionItem], list[FlaggedQuestionItem], bool]:
+        """SCRUM-495 + HG01: reconcile distribution HR → lock theo slot → regen slot lệch → flag.
+
+        Không còn swap nội dung giữa slot và không viết lại goal trong bộ nhớ: BE giữ mỗi slot nhất
+        quán (skill + goal + nguồn), sửa ngầm ở đây chỉ làm Why ask lệch với plan đã lưu bên BE.
+        """
+        if not questions:
+            return questions, [], True
+
+        plan = request.approved_plan
+        # HG02: ép outline.type khớp questionTypeDistribution (no-op nếu generate_from_plan đã làm)
+        _reconcile_outline_types_to_distribution(
+            plan, language=request.language, rewrite_slots=True
+        )
+        self._lock_questions_to_outline(questions, plan)
+        # Không có outline: vẫn ép type theo distribution HR theo thứ tự order
+        _apply_distribution_types_when_no_outline(questions, plan)
+
+        outline_by_order = {
+            o.order: o for o in (plan.recommended_question_outline or [])
+        }
+        expected_dist = _expected_type_counts(plan)
+
+        # HG01: câu lệch slot (nội dung khác skill/goal, hoặc LLM ghi skill của slot khác) → regen đúng slot
+        for attempt in range(_LABEL_MISMATCH_MAX_RETRIES):
+            mismatched = [
+                q
+                for q in questions
+                if q.order is not None
+                and _slot_mismatch_reasons(q, outline_by_order.get(q.order), outline_by_order)
+            ]
+            if not mismatched:
+                break
+            logger.info(
+                "SCRUM-495 label mismatch regen round=%s orders=%s",
+                attempt + 1,
+                [q.order for q in mismatched],
+            )
+            for q in mismatched:
+                order = q.order
+                if order is None:
+                    continue
+                replacement, err = self._generate_from_plan_single(
+                    request,
+                    system_chunks,
+                    hr_chunks,
+                    all_chunks,
+                    order_start=order,
+                    order_end=order,
+                    batch_count=1,
+                )
+                if err or not replacement:
+                    logger.warning(
+                        "SCRUM-495 regen slot %s failed: %s", order, err
+                    )
+                    continue
+                new_q = replacement[0]
+                new_q.order = order
+                self._lock_questions_to_outline([new_q], plan)
+                _apply_distribution_types_when_no_outline([new_q], plan)
+                idx = next(
+                    (i for i, x in enumerate(questions) if x.order == order),
+                    None,
+                )
+                if idx is not None:
+                    questions[idx] = new_q
+
+        # HG02: vẫn lệch count → đổi type câu thừa sang loại thiếu + regen
+        for round_i in range(_DISTRIBUTION_FIX_MAX_ROUNDS):
+            actual_dist = Counter(
+                _safe_normalize_question_type(q.question_type) for q in questions
+            )
+            if not expected_dist or actual_dist == expected_dist:
+                break
+            to_fix = _force_types_toward_distribution(questions, expected_dist)
+            if not to_fix:
+                break
+            # Cập nhật outline.type cho các order vừa ép (để lock/regen bám đúng)
+            for q in to_fix:
+                if q.order is not None and q.order in outline_by_order:
+                    outline_by_order[q.order].type = _safe_normalize_question_type(
+                        q.question_type
+                    )
+            logger.info(
+                "SCRUM-495 distribution force+regen round=%s orders=%s expected=%s actual=%s",
+                round_i + 1,
+                [q.order for q in to_fix],
+                dict(expected_dist),
+                dict(actual_dist),
+            )
+            for q in to_fix:
+                order = q.order
+                if order is None:
+                    continue
+                replacement, err = self._generate_from_plan_single(
+                    request,
+                    system_chunks,
+                    hr_chunks,
+                    all_chunks,
+                    order_start=order,
+                    order_end=order,
+                    batch_count=1,
+                )
+                if err or not replacement:
+                    continue
+                new_q = replacement[0]
+                new_q.order = order
+                # Giữ type đã ép theo distribution
+                forced = _safe_normalize_question_type(q.question_type)
+                self._lock_questions_to_outline([new_q], plan)
+                new_q.question_type = forced
+                idx = next(
+                    (i for i, x in enumerate(questions) if x.order == order),
+                    None,
+                )
+                if idx is not None:
+                    questions[idx] = new_q
+
+        # HG01: KHÔNG rewrite Domain/Why ask theo content — giữ metadata slot HR
+        # Flag theo content ↔ outline slot (sau regen vẫn lệch)
+        flagged: list[FlaggedQuestionItem] = []
+        for q in questions:
+            q.needs_review = False
+            q.mismatch_reasons = []
+            reasons: list[str] = []
+            outline = outline_by_order.get(q.order) if q.order is not None else None
+            reasons.extend(_slot_mismatch_reasons(q, outline, outline_by_order))
+            if outline is not None:
+                want = _safe_normalize_question_type(outline.type)
+                got = _safe_normalize_question_type(q.question_type)
+                if got != want:
+                    reasons.append(f"type_mismatch:expected={want}:actual={got}")
+            if reasons:
+                q.needs_review = True
+                q.mismatch_reasons = list(dict.fromkeys(reasons))
+                flagged.append(
+                    FlaggedQuestionItem(order=q.order or 0, reasons=q.mismatch_reasons)
+                )
+
+        actual_final = Counter(
+            _safe_normalize_question_type(q.question_type) for q in questions
+        )
+        distribution_match = (not expected_dist) or actual_final == expected_dist
+        if not distribution_match:
+            logger.warning(
+                "SCRUM-495 distribution still mismatched: expected=%s actual=%s",
+                dict(expected_dist),
+                dict(actual_final),
+            )
+            reason = (
+                f"distribution_mismatch:expected={dict(expected_dist)}"
+                f":actual={dict(actual_final)}"
+            )
+            for q in questions:
+                if not q.needs_review:
+                    q.needs_review = True
+                    q.mismatch_reasons = [reason]
+                    flagged.append(
+                        FlaggedQuestionItem(order=q.order or 0, reasons=[reason])
+                    )
+                else:
+                    q.mismatch_reasons = list(
+                        dict.fromkeys([*(q.mismatch_reasons or []), reason])
+                    )
+
+        questions = apply_provenance_to_questions(
+            questions,
+            chunks=all_chunks,
+            job_description=request.job_description,
+        )
+        return questions, flagged, distribution_match
+
+
+def _safe_normalize_question_type(value: str | None) -> str:
+    raw = (value or "technical").strip()
+    try:
+        return normalize_question_type(raw)
+    except ValueError:
+        key = raw.lower().replace(" ", "-").replace("_", "-")
+        aliases = {
+            "culture": "situational",
+            "culture-fit": "situational",
+            "culturefit": "situational",
+            "systemdesign": "system-design",
+            "problemsolving": "problem-solving",
+            "behavioural": "behavioral",
+            "follow-up": "technical",
+            "followup": "technical",
+        }
+        key = aliases.get(key, key)
+        return key if key in VALID_QUESTION_TYPES else "technical"
+
+
+def _expected_type_counts(plan: QuestionGenerationPlan) -> Counter:
+    """SCRUM-495 harden: ưu tiên questionTypeDistribution (config HR UI)."""
+    dist_items = plan.question_type_distribution or []
+    if dist_items:
+        return Counter(
+            {
+                _safe_normalize_question_type(getattr(item, "type", "technical")): int(
+                    item.count
+                )
+                for item in dist_items
+                if int(getattr(item, "count", 0) or 0) > 0
+            }
+        )
+    outline = plan.recommended_question_outline or []
+    if outline:
+        return Counter(_safe_normalize_question_type(o.type) for o in outline)
+    return Counter()
+
+
+_TECHNICAL_OUTLINE_TYPES = frozenset({"technical", "system-design", "problem-solving"})
+_SOFT_SKILL_LABELS = {"behavioral": "Behavioral", "situational": "Situational"}
+
+
+def _canon_skill(name: str | None) -> str:
+    """"React.js" / "ReactJS" / "react" → "react" (giống CanonSkill phía BE)."""
+    compact = re.sub(r"[\s._\-]", "", (name or "").lower())
+    return compact[:-2] if len(compact) > 4 and compact.endswith("js") else compact
+
+
+def _is_technical_outline_type(normalized_type: str) -> bool:
+    return normalized_type in _TECHNICAL_OUTLINE_TYPES
+
+
+def _default_goal_for_slot(skill: str, slot_type: str, language: str | None) -> str:
+    """Why ask mặc định khi slot đổi type/skill — câu chữ kỹ thuật giống BE (StudioOutlineSlotHelper)."""
+    english = normalize_output_language(language) == "English"
+    if slot_type == "behavioral":
+        return (
+            "Assess teamwork and communication through a real past experience."
+            if english
+            else "Đánh giá kỹ năng làm việc nhóm và giao tiếp qua trải nghiệm thực tế."
+        )
+    if slot_type == "situational":
+        return (
+            "Assess judgment when handling a realistic work situation."
+            if english
+            else "Đánh giá cách xử lý một tình huống công việc thực tế."
+        )
+    return (
+        f"Assess hands-on {skill} knowledge relevant to this role."
+        if english
+        else f"Đánh giá kiến thức {skill} thực tế cho vị trí này."
+    )
+
+
+def _least_covered_technical_skill(plan: QuestionGenerationPlan) -> str:
+    """Slot mềm chuyển thành kỹ thuật: chọn skill của plan đang có ít slot kỹ thuật nhất."""
+    candidates = [c.skill for c in (plan.coverage or []) if (c.skill or "").strip()]
+    if not candidates:
+        candidates = [s for s in (plan.skills or []) if (s or "").strip()]
+    if not candidates:
+        return "Technical"
+    used = Counter(
+        _canon_skill(o.skill)
+        for o in (plan.recommended_question_outline or [])
+        if _is_technical_outline_type(_safe_normalize_question_type(o.type))
+    )
+    return min(candidates, key=lambda s: used.get(_canon_skill(s), 0))
+
+
+def _rewrite_slot_for_new_type(
+    slot: Any,
+    old_type: str,
+    new_type: str,
+    plan: QuestionGenerationPlan,
+    language: str | None,
+) -> None:
+    """HG01: slot đổi nhóm kỹ thuật ↔ mềm thì đổi luôn skill + goal và bỏ nguồn cũ của skill trước."""
+    was_technical = _is_technical_outline_type(old_type)
+    is_technical = _is_technical_outline_type(new_type)
+    if was_technical == is_technical:
+        return
+    if is_technical:
+        skill = _least_covered_technical_skill(plan)
+    else:
+        skill = _SOFT_SKILL_LABELS.get(new_type, new_type.title())
+    slot.skill = skill
+    slot.focus_area = skill
+    slot.goal = _default_goal_for_slot(skill, new_type, language)
+    slot.citations = []
+    slot.planned_skill = skill
+    slot.relabeled = True
+
+
+def _reconcile_outline_types_to_distribution(
+    plan: QuestionGenerationPlan,
+    *,
+    language: str | None = None,
+    rewrite_slots: bool = False,
+) -> int:
+    """
+    Nếu outline đếm type ≠ distribution HR → sửa outline.type in-memory.
+    Trả về số slot đã đổi type.
+    """
+    expected = _expected_type_counts(plan)
+    outline = plan.recommended_question_outline or []
+    if not expected or not outline:
+        return 0
+
+    actual = Counter(_safe_normalize_question_type(o.type) for o in outline)
+    if actual == expected:
+        return 0
+
+    changed = 0
+    # Xây hàng đợi loại còn thiếu
+    deficit: list[str] = []
+    for t, need in expected.items():
+        have = actual.get(t, 0)
+        if need > have:
+            deficit.extend([t] * (need - have))
+
+    # Slot thừa (loại vượt expected) — ưu tiên order lớn
+    surplus_slots = []
+    running = Counter()
+    for o in sorted(outline, key=lambda x: x.order):
+        t = _safe_normalize_question_type(o.type)
+        running[t] += 1
+        if running[t] > expected.get(t, 0):
+            surplus_slots.append(o)
+
+    for o in surplus_slots:
+        if not deficit:
+            break
+        new_t = deficit.pop(0)
+        old = _safe_normalize_question_type(o.type)
+        if old != new_t:
+            logger.info(
+                "SCRUM-495 reconcile outline order=%s type %s → %s (match HR distribution)",
+                o.order,
+                old,
+                new_t,
+            )
+            o.type = new_t
+            # HG01: luồng HR — đổi type là đổi cả slot, không để slot behavioral mang skill/goal kỹ thuật.
+            # Luồng Coach/Candidate giữ skill blueprint (chấm năng lực theo skill) nên không bật.
+            if rewrite_slots:
+                _rewrite_slot_for_new_type(o, old, new_t, plan, language)
+            changed += 1
+
+    return changed
+
+
+def _apply_distribution_types_when_no_outline(
+    questions: list[GeneratedQuestionItem],
+    plan: QuestionGenerationPlan,
+) -> None:
+    """Không có outline: gán type theo distribution HR theo thứ tự câu."""
+    if plan.recommended_question_outline:
+        return
+    expected = _expected_type_counts(plan)
+    if not expected:
+        return
+    type_queue: list[str] = []
+    # Ổn định thứ tự: technical → behavioral → situational → còn lại
+    preferred = ["technical", "behavioral", "situational", "system-design", "problem-solving"]
+    for t in preferred:
+        if t in expected:
+            type_queue.extend([t] * expected[t])
+    for t, n in expected.items():
+        if t not in preferred:
+            type_queue.extend([t] * n)
+    for i, q in enumerate(sorted(questions, key=lambda x: x.order or 0)):
+        if i < len(type_queue):
+            q.question_type = type_queue[i]
+
+
+def _force_types_toward_distribution(
+    questions: list[GeneratedQuestionItem],
+    expected: Counter,
+) -> list[GeneratedQuestionItem]:
+    """Đổi type câu thừa → loại thiếu. Trả list câu đã đổi (cần regen)."""
+    if not expected:
+        return []
+    actual = Counter(_safe_normalize_question_type(q.question_type) for q in questions)
+    if actual == expected:
+        return []
+
+    deficit: list[str] = []
+    for t, need in expected.items():
+        have = actual.get(t, 0)
+        if need > have:
+            deficit.extend([t] * (need - have))
+
+    changed: list[GeneratedQuestionItem] = []
+    running = Counter()
+    for q in sorted(questions, key=lambda x: x.order or 0):
+        t = _safe_normalize_question_type(q.question_type)
+        running[t] += 1
+        if running[t] > expected.get(t, 0) and deficit:
+            new_t = deficit.pop(0)
+            q.question_type = new_t
+            changed.append(q)
+    return changed
+
+
+def _label_tokens(text: str) -> list[str]:
+    raw = (text or "").lower()
+    raw = raw.replace("c#", "csharp").replace(".net", "dotnet").replace("node.js", "nodejs")
+    raw = raw.replace("next.js", "nextjs").replace("asp.net", "aspnet")
+    raw = raw.replace("postgresql", "postgres").replace("react.js", "react")
+    parts = re.findall(r"[a-z0-9+]{2,}", raw)
+    stop = {
+        "and", "or", "the", "for", "with", "from", "that", "this", "into", "about",
+        "các", "của", "và", "trong", "khi", "một", "câu", "hỏi", "đánh", "giá",
+    }
+    return [p for p in parts if p not in stop and len(p) >= 2]
+
+
+# Topic kỹ thuật mịn hơn domain rộng — React hooks ≠ Next.js SSR dù cùng “frontend”
+# HG01: bỏ các từ tiếng Anh thông dụng ("explain", "index", "query", "join", "select", "transaction",
+# "rest", "express", "compose", "interface", "lambda") — trước đây câu "Explain the useEffect hook"
+# bị xếp vào SQL, "the rest of" thành REST API → regen / gắn cờ nhầm câu đúng.
+_TOPIC_MARKERS: dict[str, tuple[str, ...]] = {
+    "sql": (
+        "postgres", "postgresql", "mysql", "sql", "sql server", "t-sql", "sqlite",
+        "inner join", "left join", "join clause", "group by", "groupby",
+        "explain analyze", "query plan", "execution plan", "truy vấn", "foreign key",
+        "database index", "composite index", "stored procedure", "n+1 query",
+    ),
+    "react_hooks": (
+        "hooks", "usestate", "useeffect", "usememo", "usecallback", "usecontext",
+        "component-based", "component based", "kiến trúc component",
+    ),
+    "next_rendering": (
+        "ssr", "ssg", "server-side rendering", "static site generation",
+        "getserversideprops", "getstaticprops", "app router", "pages router",
+    ),
+    "nextjs": ("next.js", "nextjs"),
+    "react": ("react.js", "reactjs", "react"),
+    "rest_api": (
+        "rest api", "restful", "http method", "endpoint", "status code",
+        "get/post", "put/patch", "api design", "openapi", "swagger",
+    ),
+    "nodejs": ("node.js", "nodejs", "express.js", "expressjs", "event loop", "npm"),
+    "container": (
+        "docker", "kubernetes", "k8s", "container", "dockerfile", "docker compose",
+        "docker-compose", "pod", "containerization",
+    ),
+    "dotnet": ("asp.net", "aspnet", "csharp", "c#", "dotnet", ".net", "entity framework"),
+    "typescript": ("typescript", "type annotation", "kiểu dữ liệu"),
+    "cloud": ("aws", "azure", "gcp", "s3", "aws lambda"),
+}
+
+# Thuật ngữ đặc trưng trong Why ask — nếu có trong rationale mà không có trong câu hỏi → lệch
+_DISTINCTIVE_WHY_TERMS: tuple[str, ...] = (
+    "hooks", "usestate", "useeffect", "usememo", "component-based",
+    "ssr", "ssg", "getserversideprops", "getstaticprops",
+    "nodejs", "node.js", "event loop",
+    "docker", "kubernetes",
+    "postgres", "postgresql", "mysql", "group by",
+    "rest api", "restful", "graphql",
+    "typescript", "kiểu dữ liệu",
+    "react hooks", "react hook",
+)
+
+
+def _marker_in_text(hay: str, marker: str) -> bool:
+    """
+    HG01: marker chỉ gồm chữ/số/khoảng trắng → khớp theo ranh giới từ, cho phép số nhiều "s"
+    ("rest" không khớp "interest", "endpoint" vẫn khớp "endpoints"). Marker có ký tự đặc biệt
+    (node.js, c#, t-sql, tiếng Việt có dấu) → so chuỗi con như cũ.
+    """
+    m = marker.strip().lower()
+    if not m:
+        return False
+    if re.fullmatch(r"[a-z0-9 ]+", m):
+        return re.search(rf"(?<![a-z0-9]){re.escape(m)}s?(?![a-z0-9])", hay) is not None
+    return m in hay
+
+
+def _topics_in_text(text: str) -> set[str]:
+    hay = f" {(text or '').lower()} "
+    found: set[str] = set()
+    for topic, markers in _TOPIC_MARKERS.items():
+        if any(_marker_in_text(hay, m) for m in markers):
+            found.add(topic)
+    return found
+
+
+def _domains_in_text(text: str) -> set[str]:
+    """Map topic → nhóm rộng (tương thích chỗ gọi cũ)."""
+    topics = _topics_in_text(text)
+    wide: set[str] = set()
+    mapping = {
+        "sql": "sql",
+        "react_hooks": "frontend",
+        "next_rendering": "frontend",
+        "nextjs": "frontend",
+        "react": "frontend",
+        "typescript": "frontend",
+        "rest_api": "backend",
+        "nodejs": "backend",
+        "dotnet": "backend",
+        "container": "container",
+        "cloud": "cloud",
+    }
+    for t in topics:
+        wide.add(mapping.get(t, t))
+    return wide
+
+
+def _distinctive_terms_in_text(text: str) -> set[str]:
+    hay = f" {(text or '').lower()} "
+    found: set[str] = set()
+    for term in _DISTINCTIVE_WHY_TERMS:
+        if _marker_in_text(hay, term):
+            found.add(term)
+    return found
+
+
+def _term_in_content(content_hay: str, term: str) -> bool:
+    """Why ask ghi "hooks", câu hỏi ghi "hook" vẫn là cùng ý — so cả dạng số ít."""
+    singular = term[:-1] if term.endswith("s") and len(term) > 3 else term
+    return _marker_in_text(content_hay, term) or _marker_in_text(content_hay, singular)
+
+
+def _label_mismatches_content(content: str, label: str) -> bool:
+    """
+    True nếu skill/Why ask không bám câu hỏi:
+    - topic kỹ thuật xung đột, hoặc
+    - Why ask nêu thuật ngữ đặc trưng (hooks, SSR, Node…) không có trong câu hỏi.
+    """
+    if not (content or "").strip() or not (label or "").strip():
+        return False
+
+    # 1) Topic conflict (React hooks vs Next SSR; REST vs React; SQL vs container…)
+    ct = _topics_in_text(content)
+    lt = _topics_in_text(label)
+    if ct and lt and not (ct & lt):
+        # Ngoại lệ: nextjs + next_rendering cùng họ; react + react_hooks
+        related = [
+            {"nextjs", "next_rendering"},
+            {"react", "react_hooks"},
+            {"nodejs", "rest_api"},
+            {"dotnet", "rest_api"},
+        ]
+        loosely_ok = any((ct & pair) and (lt & pair) for pair in related)
+        if not loosely_ok:
+            return True
+
+    # 2) Distinctive terms in label missing from content (hooks trong Why ask, câu hỏi chỉ SSR)
+    label_terms = _distinctive_terms_in_text(label)
+    if not label_terms:
+        return False
+    content_hay = f" {(content or '').lower()} "
+    if not any(_term_in_content(content_hay, t) for t in label_terms):
+        return True
+    return False
+
+
+def _domains_conflict(content: str, label: str) -> bool:
+    """True khi content và Why ask/skill lệch chủ đề (topic hoặc thuật ngữ đặc trưng)."""
+    return _label_mismatches_content(content, label)
+
+
+def _infer_skill_label_from_content(question: str) -> str | None:
+    hay = (question or "").lower()
+    if "postgres" in hay or "postgresql" in hay:
+        return "PostgreSQL"
+    if "mysql" in hay:
+        return "MySQL"
+    if re.search(r"\b(sql|join|group by)\b", hay):
+        return "SQL"
+    if "docker" in hay or "container" in hay:
+        return "Docker"
+    if "kubernetes" in hay or "k8s" in hay:
+        return "Kubernetes"
+    if "ssr" in hay or "ssg" in hay or "next.js" in hay or "nextjs" in hay:
+        return "Next.js"
+    if "rest" in hay or "restful" in hay or "endpoint" in hay:
+        return "REST API"
+    if "hook" in hay or "usestate" in hay or "useeffect" in hay:
+        return "React"
+    if "react" in hay:
+        return "React"
+    if "typescript" in hay:
+        return "TypeScript"
+    if "node.js" in hay or "nodejs" in hay:
+        return "Node.js"
+    if "asp.net" in hay or "c#" in hay:
+        return "ASP.NET Core"
+    return None
+
+
+def _build_why_ask_for_content(skill: str, focus: str, question: str) -> str:
+    """Why ask ngắn khớp nội dung câu — không giữ goal lệch chủ đề."""
+    sk = (skill or "").strip() or _infer_skill_label_from_content(question) or "kỹ năng liên quan"
+    fo = (focus or "").strip()
+    tip = re.sub(r"\s+", " ", (question or "").strip())
+    if len(tip) > 100:
+        tip = tip[:97] + "…"
+    if fo and fo.lower() != sk.lower() and not _label_mismatches_content(question, fo):
+        return f"Đánh giá {sk} ({fo}) — {tip}"
+    return f"Đánh giá {sk} — {tip}"
+
+
+def _topics_related(a: set[str], b: set[str]) -> bool:
+    """Hai tập topic có cùng họ lỏng (next↔ssr, react↔hooks, node↔rest…)."""
+    if a & b:
+        return True
+    related = [
+        {"nextjs", "next_rendering"},
+        {"react", "react_hooks"},
+        {"nodejs", "rest_api"},
+        {"dotnet", "rest_api"},
+    ]
+    return any((a & pair) and (b & pair) for pair in related)
+
+
+def _rest_or_backend_dominates_frontend_slot(content: str, skill_topics: set[str]) -> bool:
+    """HR30: slot React/Next nhưng câu chủ yếu REST/API/SQL/container."""
+    frontend = {"react", "react_hooks", "nextjs", "next_rendering", "typescript"}
+    if not (skill_topics & frontend):
+        return False
+    ct = _topics_in_text(content)
+    foreign = ct & {"rest_api", "sql", "container", "nodejs", "dotnet", "cloud"}
+    if not foreign:
+        return False
+    # Có nhắc React sơ sài nhưng trọng tâm REST → vẫn lệch slot
+    if "rest_api" in foreign:
+        hay = (content or "").lower()
+        rest_hits = sum(
+            1
+            for m in ("rest", "api", "http", "endpoint", "status code", "method")
+            if m in hay
+        )
+        react_hits = sum(
+            1
+            for m in ("hooks", "usestate", "useeffect", "jsx", "virtual dom", "component")
+            if m in hay
+        )
+        if rest_hits >= 2 and rest_hits > react_hits:
+            return True
+    # foreign khác frontend và không giao frontend topic trong content
+    if foreign and not (ct & frontend):
+        return True
+    if foreign and (ct & frontend) and len(foreign) >= 1:
+        # content vừa có react vừa sql/docker → ưu tiên foreign nếu skill chỉ frontend
+        if foreign & {"sql", "container", "cloud"}:
+            return True
+    return False
+
+
+def _content_mismatches_slot(
+    q: GeneratedQuestionItem,
+    outline: Any | None,
+) -> list[str]:
+    """
+    SCRUM-495 HG01: nội dung câu phải khớp skill (+ goal) của slot HR.
+    Không dùng để rewrite nhãn — chỉ quyết định regen/flag.
+    """
+    if outline is None:
+        return []
+    reasons: list[str] = []
+    content = f"{q.question or ''} {q.code_snippet or ''}"
+    haystack = content.lower()
+    skill = (getattr(outline, "skill", None) or "").strip()
+    goal = (getattr(outline, "goal", None) or "").strip()
+
+    qt = _safe_normalize_question_type(getattr(outline, "type", None))
+    soft_types = {"behavioral", "situational"}
+    if qt in soft_types:
+        soft_markers = (
+            "bạn ", "you ", "team", "conflict", "deadline", "stakeholder",
+            "tinh huong", "tình huống", "ứng xử", "hanh vi", "hành vi",
+            "pressure", "priority", "communicate", "collaborate",
+            "xung đột", "đồng nghiệp", "sếp ", "manager",
+        )
+        if any(m in haystack for m in soft_markers):
+            return []
+
+    st = _topics_in_text(skill)
+    ct = _topics_in_text(content)
+    gt = _topics_in_text(goal)
+
+    if skill and _rest_or_backend_dominates_frontend_slot(content, st):
+        reasons.append(f"content_mismatch_skill:{skill}")
+    elif st and ct and not _topics_related(st, ct):
+        reasons.append(f"content_mismatch_skill:{skill}")
+    elif skill:
+        # Skill ngoài từ điển topic: câu nhắc skill HOẶC focus của slot đều tính là đúng slot
+        # (vd slot C# / focus DI hỏi "DI là gì") — chỉ xét skill làm regen nhầm cả câu hợp lệ.
+        focus = (getattr(outline, "focus_area", None) or "").strip()
+        tokens = _label_tokens(skill) + _label_tokens(focus)
+        compact = re.sub(r"[^a-z0-9+]", "", haystack)
+        if tokens and not any(t in haystack or t in compact for t in tokens):
+            if not (st and ct and _topics_related(st, ct)):
+                reasons.append(f"content_mismatch_skill:{skill}")
+
+    # Goal/Why ask (đã khóa từ outline): content phải liên quan goal nếu goal có topic rõ
+    if goal and gt and ct and not _topics_related(gt, ct):
+        reasons.append("content_mismatch_rationale_goal")
+    elif goal and _label_mismatches_content(content, goal):
+        # hooks trong goal, câu hỏi SSR — hoặc Node trong goal, câu REST trên slot React
+        reasons.append("content_mismatch_rationale_goal")
+
+    return list(dict.fromkeys(reasons))
+
+
+def sanitize_outline_skill_goal(outline: list[Any], language: str | None = None) -> int:
+    """
+    Plan-time: nếu goal lệch topic so với skill → rewrite goal ngắn theo skill.
+    Trả về số slot đã sửa.
+    """
+    changed = 0
+    for item in outline or []:
+        skill = (getattr(item, "skill", None) or "").strip()
+        goal = (getattr(item, "goal", None) or "").strip()
+        if not skill or not goal:
+            continue
+        st = _topics_in_text(skill)
+        gt = _topics_in_text(goal)
+        if not st or not gt:
+            continue
+        if _topics_related(st, gt):
+            continue
+        new_goal = (
+            f"Assess hands-on {skill} knowledge relevant to this role."
+            if language and normalize_output_language(language) == "English"
+            else f"Đánh giá năng lực {skill}"
+        )
+        logger.warning(
+            "SCRUM-495 sanitize outline order=%s goal lệch skill=%r — rewrite goal",
+            getattr(item, "order", "?"),
+            skill,
+        )
+        item.goal = new_goal
+        changed += 1
+    return changed
+
+
+def _align_why_ask_and_skill_to_content(
+    questions: list[GeneratedQuestionItem],
+    outline_by_order: dict[int, Any],
+) -> int:
+    """DEPRECATED — không gọi trong pipeline (che lệch bằng nhãn). Giữ stub = 0."""
+    _ = questions, outline_by_order
+    return 0
+
+
+def _score_content_to_slot(q: GeneratedQuestionItem, outline: Any) -> float:
+    """Điểm khớp nội dung với skill/goal slot (cao hơn = tốt hơn)."""
+    haystack = f"{q.question or ''} {q.code_snippet or ''}".lower()
+    compact = re.sub(r"[^a-z0-9+]", "", haystack)
+    skill = (getattr(outline, "skill", None) or "").strip()
+    goal = (getattr(outline, "goal", None) or "").strip()
+    score = 0.0
+    for t in _label_tokens(skill):
+        if t in haystack or t in compact:
+            score += 3.0
+    for t in _label_tokens(goal):
+        if len(t) >= 4 and (t in haystack or t in compact):
+            score += 1.0
+    return score
+
+
+def _swap_question_content(a: GeneratedQuestionItem, b: GeneratedQuestionItem) -> None:
+    """Đổi nội dung giữa 2 câu — giữ order và metadata đã khóa."""
+    fields = (
+        "question",
+        "sample_answer",
+        "code_snippet",
+        "code_template_type",
+        "image_hint",
+        "evaluation_criteria",
+        "citations",
+        "answer_method",
+    )
+    for f in fields:
+        va = getattr(a, f, None)
+        vb = getattr(b, f, None)
+        setattr(a, f, vb)
+        setattr(b, f, va)
+
+
+def _reassign_mismatched_contents(
+    questions: list[GeneratedQuestionItem],
+    outline_by_order: dict[int, Any],
+) -> int:
+    """
+    Greedy: với các câu lệch skill/goal, hoán nội dung 1-1 nếu content A khớp slot B hơn.
+    Trả về số lần swap.
+    """
+    if not outline_by_order or len(questions) < 2:
+        return 0
+
+    mismatched = [
+        q
+        for q in questions
+        if q.order is not None
+        and q.order in outline_by_order
+        and _content_mismatch_reasons(q, outline_by_order[q.order])
+    ]
+    if len(mismatched) < 2:
+        return 0
+
+    swaps = 0
+    # Lặp đến khi không cải thiện
+    improved = True
+    while improved:
+        improved = False
+        for i, qi in enumerate(mismatched):
+            oi = outline_by_order.get(qi.order)  # type: ignore[arg-type]
+            if oi is None:
+                continue
+            best_j = None
+            best_gain = 0.0
+            score_ii = _score_content_to_slot(qi, oi)
+            for j, qj in enumerate(mismatched):
+                if i >= j:
+                    continue
+                oj = outline_by_order.get(qj.order)  # type: ignore[arg-type]
+                if oj is None:
+                    continue
+                score_jj = _score_content_to_slot(qj, oj)
+                # Sau swap: qi content ↔ qj content
+                # score nếu qi nhận content qj cho slot oi, qj nhận content qi cho slot oj
+                # Dùng tạm swap thử
+                _swap_question_content(qi, qj)
+                new_ii = _score_content_to_slot(qi, oi)
+                new_jj = _score_content_to_slot(qj, oj)
+                gain = (new_ii + new_jj) - (score_ii + score_jj)
+                # Đảo lại để thử cặp khác
+                _swap_question_content(qi, qj)
+                if gain > best_gain + 0.5:
+                    best_gain = gain
+                    best_j = j
+            if best_j is not None:
+                qj = mismatched[best_j]
+                _swap_question_content(qi, qj)
+                swaps += 1
+                improved = True
+                logger.info(
+                    "SCRUM-495 swapped content orders %s ↔ %s (gain=%.1f)",
+                    qi.order,
+                    qj.order,
+                    best_gain,
+                )
+                break  # restart while sau mỗi swap
+    return swaps
+
+
+def _llm_echo_mismatch_reason(
+    q: GeneratedQuestionItem,
+    outline: Any | None,
+    outline_by_order: dict[int, Any],
+) -> str | None:
+    """
+    HG01: LLM tự ghi skill của câu = skill của MỘT SLOT KHÁC → nó đã viết nội dung slot khác dưới
+    order này, lock sẽ dán nhãn sai. Chỉ bắt khi trùng skill slot khác để không báo nhầm kiểu
+    "React" vs "React.js".
+    """
+    echo = _canon_skill(getattr(q, "llm_skill_echo", None))
+    if not echo or outline is None:
+        return None
+    own = _canon_skill(getattr(outline, "skill", None))
+    if not own or echo == own:
+        return None
+    other_skills = {
+        _canon_skill(getattr(o, "skill", None))
+        for order, o in outline_by_order.items()
+        if order != q.order
+    }
+    if echo in other_skills:
+        return f"llm_skill_echo_mismatch:{q.llm_skill_echo}"
+    return None
+
+
+def _slot_mismatch_reasons(
+    q: GeneratedQuestionItem,
+    outline: Any | None,
+    outline_by_order: dict[int, Any],
+) -> list[str]:
+    """Lý do câu không khớp slot HR: nội dung ↔ skill/goal, và LLM ghi skill của slot khác."""
+    reasons = list(_content_mismatch_reasons(q, outline))
+    echo_reason = _llm_echo_mismatch_reason(q, outline, outline_by_order)
+    if echo_reason:
+        reasons.append(echo_reason)
+    return list(dict.fromkeys(reasons))
+
+
+def _content_mismatch_reasons(
+    q: GeneratedQuestionItem,
+    outline: Any | None,
+) -> list[str]:
+    """Trả list lý do nếu nội dung không bám skill/goal của slot HR — nguồn regen/flag."""
+    return _content_mismatches_slot(q, outline)
 
 
 def _validate_owner_and_jd(owner_id: str, job_description: str) -> str | None:
@@ -1567,6 +2548,7 @@ def _validate_questions_against_plan(
     *,
     expected_count: int | None = None,
     strict_count: bool = True,
+    enforce_distribution: bool = True,
 ) -> str | None:
     target = expected_count if expected_count is not None else plan.total_questions
     got = len(questions)
@@ -1602,20 +2584,20 @@ def _validate_questions_against_plan(
             f"không khớp yêu cầu ({target})."
         )
 
-    if expected_count is None and plan.question_type_distribution:
-        expected = Counter(
-            {getattr(item, "type"): item.count for item in plan.question_type_distribution}
-        )
-        actual = Counter(q.question_type for q in questions)
-        if actual != expected:
-            logger.warning(
-                "questionType distribution lệch: expected=%s actual=%s",
-                dict(expected),
-                dict(actual),
+    # SCRUM-495 / HG02: so từng loại (normalize). Mặc định chỉ cảnh báo —
+    # align_flag_and_regen xử lý regen + flag; enforce_distribution=True mới trả error cứng.
+    if enforce_distribution:
+        expected = _expected_type_counts(plan)
+        if expected:
+            actual = Counter(
+                _safe_normalize_question_type(q.question_type) for q in questions
             )
-            if sum(actual.values()) != plan.total_questions and abs(
-                sum(actual.values()) - plan.total_questions
-            ) > 2:
-                return "Phân bổ questionType không khớp approved plan."
+            if actual != expected:
+                msg = (
+                    "Phân bổ questionType không khớp approved plan: "
+                    f"expected={dict(expected)} actual={dict(actual)}"
+                )
+                logger.warning("SCRUM-495 %s", msg)
+                return msg
 
     return None

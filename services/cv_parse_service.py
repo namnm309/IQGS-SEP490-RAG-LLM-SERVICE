@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -63,6 +64,9 @@ CV_SYSTEM_PROMPT = """Bạn là trợ lý AI phân tích CV/hồ sơ ứng viên
 5. CHỈ trả JSON hợp lệ, không markdown fence.
 6. KHÔNG bịa kỹ năng không có trong CV.
 7. skills: mảng chuỗi chuẩn hóa; [] nếu không có.
+   - Tên ngắn, ASCII; dùng gạch nối "-" (không en-dash).
+   - Acronym trong ngoặc OK: "Server-Driven UI (SDUI)".
+   - Không emoji / ký tự đặc biệt lạ; không soft-skill / marketing.
 8. summary tiếng Việt ngắn; chuỗi rỗng nếu thiếu thông tin.
 9. TUYỆT ĐỐI KHÔNG suy luận level (intern/fresher/junior/middle/senior/lead).
 10. suggestedRole chỉ gợi ý role — null nếu thiếu căn cứ.
@@ -307,15 +311,53 @@ class CvParseService:
 
     @staticmethod
     def _normalize_skills(raw: Any) -> list[str]:
+        """SCRUM-493: sanitize skill CV — en-dash→-, giữ (), drop non-IT / char lạ."""
         if not isinstance(raw, list):
             return []
+        non_it_exact = {
+            "marketing",
+            "marketting",
+            "sales",
+            "seo",
+            "finance",
+            "accounting",
+            "accountant",
+            "communication",
+            "leadership",
+            "teamwork",
+            "excel",
+            "hr",
+        }
         result: list[str] = []
         seen: set[str] = set()
         for item in raw:
             text = str(item or "").strip()
             if not text:
                 continue
-            key = text.lower()
+            text = (
+                text.replace("\u2013", "-")
+                .replace("\u2014", "-")
+                .replace("\u2212", "-")
+                .replace("\u00ad", "-")
+            )
+            text = re.sub(r"\s+", " ", text).strip()
+            text = "".join(
+                c
+                for c in text
+                if c.isalnum() or c in " .#+/-()"
+            )
+            text = re.sub(r"\s+", " ", text).strip()
+            text = re.sub(r"\(\s*\)", "", text).strip()
+            text = re.sub(r"\s+", " ", text).strip()
+            if len(text) > 40:
+                text = text[:40].rstrip()
+            if len(text) < 2 or not any(c.isalpha() for c in text):
+                continue
+            key = re.sub(r"[\s_\-]+", "", text.lower())
+            if "marketing" in key or "marketting" in key:
+                continue
+            if key in non_it_exact:
+                continue
             if key in seen:
                 continue
             seen.add(key)

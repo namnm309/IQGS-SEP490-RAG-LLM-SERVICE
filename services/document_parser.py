@@ -9,7 +9,8 @@ from docx import Document as DocxDocument
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_EXTENSIONS = frozenset({".pdf", ".docx", ".txt", ".jsonl"})
+# SCRUM-486: .md đọc UTF-8 giống .txt (seed roadmap/tech).
+SUPPORTED_EXTENSIONS = frozenset({".pdf", ".docx", ".txt", ".jsonl", ".md"})
 
 
 class DocumentParser:
@@ -35,6 +36,7 @@ class DocumentParser:
         elif ext == ".docx":
             text = self._extract_docx(file_path)
         else:
+            # .txt / .md
             text = file_path.read_text(encoding="utf-8")
 
         if not text or not text.strip():

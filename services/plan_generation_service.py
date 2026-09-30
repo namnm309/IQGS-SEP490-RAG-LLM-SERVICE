@@ -38,6 +38,7 @@ from services.rag_context_helpers import (
 )
 from services.plan_provenance_validator import apply_provenance_to_plan_dict
 from services.outline_source_binder import bind_sources_to_outline
+from services.question_generation_service import sanitize_outline_skill_goal
 from services.rag_retrieval_service import RagRetrievalService
 from vectorstores.base import RetrievedChunk
 from helpers.language_prompt import free_text_language_label, language_instruction_block
@@ -279,6 +280,15 @@ class PlanGenerationService:
 
         if parse_error:
             return self._fail(start, "Lỗi sinh plan", "PLAN_GENERATION", parse_error)
+
+        # SCRUM-495 + HG01: skill/goal cùng họ — goal lệch skill thì viết lại goal ngắn theo ngôn ngữ
+        # đầu ra. Làm TRƯỚC khi khoá nguồn để JD/SYSTEM được chọn theo goal đã sửa.
+        try:
+            outline = list(plan.recommended_question_outline or [])
+            if sanitize_outline_skill_goal(outline, request.language):
+                plan = plan.model_copy(update={"recommended_question_outline": outline})
+        except Exception as exc:
+            logger.warning("Outline skill/goal sanitize skipped: %s", exc)
 
         # SCRUM-426: khóa JD (+ Admin) trên từng outline slot trước khi trả plan
         try:

@@ -262,6 +262,23 @@ class GeneratedQuestionItem(BaseModel):
     missing_admin_warning: bool | None = Field(
         default=None, alias="missingAdminWarning"
     )
+    # SCRUM-495 / HG01: câu lệch skill/type/rationale sau retry — chỉ đánh dấu, không chặn lưu
+    needs_review: bool = Field(default=False, alias="needsReview")
+    mismatch_reasons: list[str] = Field(
+        default_factory=list, alias="mismatchReasons"
+    )
+    # HG01: skill LLM tự ghi cho câu, lưu TRƯỚC khi khoá theo slot — chỉ dùng nội bộ để phát hiện
+    # LLM viết nội dung của slot khác dưới order này. Không trả ra API.
+    llm_skill_echo: str | None = Field(default=None, exclude=True)
+
+    model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
+
+
+class FlaggedQuestionItem(BaseModel):
+    """SCRUM-495: tóm tắt câu cần HR xem/regen."""
+
+    order: int
+    reasons: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
@@ -390,6 +407,10 @@ class RecommendedQuestionOutlineItem(BaseModel):
     answer_method: str | None = Field(default=None, alias="answerMethod")
     # SCRUM-426: nguồn đã khóa (JD why-asked + Admin technical-body) — Gen copy
     citations: list[PlanCitationItem] = Field(default_factory=list)
+    # HG01: dấu BE — skill mà goal/citations đang mô tả; relabeled = slot vừa đổi skill.
+    # Giữ lại để round-trip qua bind-outline-sources; không đưa vào prompt LLM.
+    planned_skill: str | None = Field(default=None, alias="plannedSkill")
+    relabeled: bool | None = None
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 
@@ -542,6 +563,11 @@ class GenerateQuestionsFromPlanResponse(BaseModel):
     error: str | None = None
     # Coach: system = có chunk SYSTEM; inferred = thiếu KB, LLM sinh theo blueprint/CV.
     kb_source: str | None = Field(default=None, alias="kbSource")
+    # SCRUM-495 / HG01-HG02: tín hiệu lệch config HR (cảnh báo nhẹ, vẫn success nếu có câu)
+    flagged_questions: list[FlaggedQuestionItem] = Field(
+        default_factory=list, alias="flaggedQuestions"
+    )
+    distribution_match: bool | None = Field(default=None, alias="distributionMatch")
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 

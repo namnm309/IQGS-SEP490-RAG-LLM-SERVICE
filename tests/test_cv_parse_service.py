@@ -228,6 +228,22 @@ def test_parse_cv_empty_file() -> None:
     assert error["exceptionType"] == "EmptyDocument"
 
 
+def test_normalize_skills_sanitizes_en_dash_and_parens() -> None:
+    """SCRUM-493: en-dash → hyphen; giữ (SDUI); drop marketing."""
+    raw = [
+        "Server\u2013Driven UI (SDUI)",
+        "React",
+        "marketing",
+        "🔥",
+        "a",
+    ]
+    out = CvParseService._normalize_skills(raw)
+    assert "Server-Driven UI (SDUI)" in out
+    assert "React" in out
+    assert "marketing" not in out
+    assert all(len(s) >= 2 for s in out)
+
+
 def test_parse_cv_ai_failure_returns_502(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(url, json=None, timeout=None):  # noqa: A002
         raise RuntimeError("vision model down")
