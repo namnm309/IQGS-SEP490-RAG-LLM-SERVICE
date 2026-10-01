@@ -1272,6 +1272,10 @@ class QuestionGenerationService:
                         "trong AVOID_QUESTIONS (phân tách |#|). Không paraphrase gần như giống; "
                         "đổi góc hỏi / ví dụ / yêu cầu cụ thể trong khi vẫn bám skill/focus/goal của outline."
                     )
+                lines.append(
+                    "REGEN_SAMPLE_ANSWER: sample_answer BẮT BUỘC là chuỗi không rỗng, cùng ngôn ngữ với câu hỏi "
+                    "và khớp nội dung câu mới. Không được trả sample_answer rỗng."
+                )
         mode, templates = _parse_content_preferences(request.hr_note)
         lines.append(f"contentMode: {mode}")
         lines.append(f"enabledCodeTemplates: {', '.join(templates)}")
