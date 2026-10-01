@@ -270,6 +270,9 @@ class GeneratedQuestionItem(BaseModel):
     # HG01: skill LLM tự ghi cho câu, lưu TRƯỚC khi khoá theo slot — chỉ dùng nội bộ để phát hiện
     # LLM viết nội dung của slot khác dưới order này. Không trả ra API.
     llm_skill_echo: str | None = Field(default=None, exclude=True)
+    # Studio regen có HR_REGEN_NOTE và LLM đổi sang chủ đề mới (skill/focus khác slot cũ).
+    # BE đọc cờ này để KHÔNG khóa skill/focus/goal theo slot cũ.
+    topic_overridden: bool = Field(default=False, alias="topicOverridden")
 
     model_config = ConfigDict(populate_by_name=True, ser_json_by_alias=True)
 

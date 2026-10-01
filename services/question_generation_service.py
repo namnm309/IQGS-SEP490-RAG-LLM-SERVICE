@@ -679,11 +679,30 @@ _TECHNICAL_KEYWORDS = frozenset(
 )
 
 
+_HR_REGEN_NOTE_RE = re.compile(r"HR_REGEN_NOTE=([^;\n]+)")
+
+
+def _extract_hr_regen_note(hr_note: str | None) -> str | None:
+    """Lấy lưu ý HR khi regen 1 câu (Studio). BE đã đổi ';' trong lưu ý thành ','."""
+    if not hr_note:
+        return None
+    match = _HR_REGEN_NOTE_RE.search(hr_note)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return value or None
+
+
 def _build_plan_retrieve_query(
     plan: QuestionGenerationPlan, hr_note: str | None
 ) -> str:
     """SCRUM-421: embed skill/focus từ plan — không chỉ JD."""
     parts: list[str] = []
+    # Lưu ý regen của HR đứng đầu query: hr_note bên dưới bị cắt 500 ký tự,
+    # nếu để cuối thì chủ đề HR yêu cầu (vd. OOP) không bao giờ được dùng để tìm tài liệu.
+    regen_note = _extract_hr_regen_note(hr_note)
+    if regen_note:
+        parts.append(regen_note)
     for cov in plan.coverage[:10]:
         if cov.skill:
             parts.append(cov.skill.strip())
@@ -1231,14 +1250,21 @@ class QuestionGenerationService:
                 )
             # SCRUM-429 / SCRUM-496: Studio regen — tránh trùng; ưu tiên HR_REGEN_NOTE nếu có
             if "STUDIO_REGEN=1" in request.hr_note or "AVOID_QUESTIONS=" in request.hr_note:
-                if "HR_REGEN_NOTE=" in request.hr_note:
+                regen_note = _extract_hr_regen_note(request.hr_note)
+                if regen_note:
+                    # HR chủ động ghi lưu ý khi regen → lưu ý là ưu tiên cao nhất, kể cả khi
+                    # nó yêu cầu chủ đề khác slot (trước đây bị cấm đổi skill nên LLM chỉ
+                    # viết lại câu cũ theo dạng khác).
                     lines.append(
-                        "HR_REGEN_NOTE (ưu tiên): Làm theo lưu ý HR (góc hỏi, độ khó, format, "
-                        "nhấn mạnh chủ đề…). Vẫn giữ ngữ cảnh skill/focus/goal của outline + JD "
-                        "— KHÔNG đổi skill/focus label của slot. "
-                        "STUDIO_REGEN / AVOID_QUESTIONS: Câu mới PHẢI khác hẳn ý và cấu trúc các mục "
-                        "trong AVOID_QUESTIONS (phân tách |#|, mục đầu thường là câu đang regen). "
-                        "Không paraphrase / viết lại gần giống câu cũ."
+                        f"HR_REGEN_NOTE (ƯU TIÊN CAO NHẤT): \"{regen_note}\". "
+                        "Câu mới PHẢI làm đúng lưu ý này. Nếu lưu ý yêu cầu một chủ đề/skill khác "
+                        "với skill/focus_area/goal của outline (vd. outline là Middleware nhưng HR "
+                        "ghi 'hỏi về OOP'), hãy BỎ chủ đề outline và hỏi đúng chủ đề HR yêu cầu; "
+                        "khi đó ghi skill và focus_area MỚI đúng với câu hỏi. Nếu lưu ý chỉ đổi "
+                        "góc hỏi/độ khó/format thì giữ skill/focus của outline. "
+                        "Giữ type của outline và ngôn ngữ đầu ra. JD chỉ là ngữ cảnh vị trí. "
+                        "AVOID_QUESTIONS: câu mới không được trùng hay paraphrase các mục trong "
+                        "AVOID_QUESTIONS (phân tách |#|, mục đầu thường là câu đang regen)."
                     )
                 else:
                     lines.append(
@@ -1486,6 +1512,9 @@ class QuestionGenerationService:
                 outline = approved_plan.recommended_question_outline[idx]
             if outline is None or not outline.citations:
                 continue
+            if q.topic_overridden:
+                # Câu đã đổi chủ đề theo lưu ý HR → citation của slot cũ không còn đúng.
+                continue
             slot_cits = list(outline.citations)
             has_slot_system = any(
                 (c.origin or "").upper() == "SYSTEM"
@@ -1569,7 +1598,11 @@ class QuestionGenerationService:
 
         # SCRUM-495 harden: reconcile type outline → distribution HR, rồi khóa metadata
         _reconcile_outline_types_to_distribution(approved_plan, language=language)
-        self._lock_questions_to_outline(questions, approved_plan)
+        self._lock_questions_to_outline(
+            questions,
+            approved_plan,
+            allow_topic_override=_extract_hr_regen_note(hr_note) is not None,
+        )
         _apply_distribution_types_when_no_outline(questions, approved_plan)
 
         # SCRUM-426: copy citations đã khóa từ outline → câu hỏi
@@ -1598,8 +1631,15 @@ class QuestionGenerationService:
     def _lock_questions_to_outline(
         questions: list[GeneratedQuestionItem],
         approved_plan: QuestionGenerationPlan,
+        *,
+        allow_topic_override: bool = False,
     ) -> None:
-        """SCRUM-495: metadata bám outline HR — type/skill/focus/rationale(=goal)."""
+        """SCRUM-495: metadata bám outline HR — type/skill/focus/rationale(=goal).
+
+        allow_topic_override=True (Studio regen có HR_REGEN_NOTE): nếu LLM đã đổi sang
+        skill/focus khác slot theo yêu cầu HR thì giữ skill/focus/rationale của LLM,
+        chỉ khóa type + answer method.
+        """
         outline_list = approved_plan.recommended_question_outline or []
         if not outline_list:
             return
@@ -1615,6 +1655,13 @@ class QuestionGenerationService:
             if outline is None:
                 continue
             q.question_type = _safe_normalize_question_type(outline.type)
+            preferred = _normalize_answer_method(
+                getattr(outline, "answer_method", None)
+            )
+            if allow_topic_override and _llm_changed_topic(q, outline):
+                q.topic_overridden = True
+                _apply_outline_answer_method(q, preferred)
+                continue
             if (outline.skill or "").strip():
                 q.skill = outline.skill.strip()
             if (outline.focus_area or "").strip():
@@ -1622,9 +1669,6 @@ class QuestionGenerationService:
             goal = (outline.goal or "").strip()
             if goal:
                 q.rationale = goal
-            preferred = _normalize_answer_method(
-                getattr(outline, "answer_method", None)
-            )
             _apply_outline_answer_method(q, preferred)
 
     def _align_flag_and_regen_from_plan(
@@ -1648,7 +1692,10 @@ class QuestionGenerationService:
         _reconcile_outline_types_to_distribution(
             plan, language=request.language, rewrite_slots=True
         )
-        self._lock_questions_to_outline(questions, plan)
+        allow_topic_override = _extract_hr_regen_note(request.hr_note) is not None
+        self._lock_questions_to_outline(
+            questions, plan, allow_topic_override=allow_topic_override
+        )
         # Không có outline: vẫn ép type theo distribution HR theo thứ tự order
         _apply_distribution_types_when_no_outline(questions, plan)
 
@@ -1663,6 +1710,10 @@ class QuestionGenerationService:
                 q
                 for q in questions
                 if q.order is not None
+                # Regen có lưu ý HR: "lệch slot" có thể là đúng ý HR (đổi chủ đề) —
+                # không tự regen kéo câu về chủ đề cũ; nếu thật sự lệch thì chỉ gắn cờ bên dưới.
+                and not allow_topic_override
+                and not q.topic_overridden
                 and _slot_mismatch_reasons(q, outline_by_order.get(q.order), outline_by_order)
             ]
             if not mismatched:
@@ -1692,7 +1743,9 @@ class QuestionGenerationService:
                     continue
                 new_q = replacement[0]
                 new_q.order = order
-                self._lock_questions_to_outline([new_q], plan)
+                self._lock_questions_to_outline(
+                    [new_q], plan, allow_topic_override=allow_topic_override
+                )
                 _apply_distribution_types_when_no_outline([new_q], plan)
                 idx = next(
                     (i for i, x in enumerate(questions) if x.order == order),
@@ -1743,7 +1796,9 @@ class QuestionGenerationService:
                 new_q.order = order
                 # Giữ type đã ép theo distribution
                 forced = _safe_normalize_question_type(q.question_type)
-                self._lock_questions_to_outline([new_q], plan)
+                self._lock_questions_to_outline(
+                    [new_q], plan, allow_topic_override=allow_topic_override
+                )
                 new_q.question_type = forced
                 idx = next(
                     (i for i, x in enumerate(questions) if x.order == order),
@@ -1760,7 +1815,8 @@ class QuestionGenerationService:
             q.mismatch_reasons = []
             reasons: list[str] = []
             outline = outline_by_order.get(q.order) if q.order is not None else None
-            reasons.extend(_slot_mismatch_reasons(q, outline, outline_by_order))
+            if not q.topic_overridden:
+                reasons.extend(_slot_mismatch_reasons(q, outline, outline_by_order))
             if outline is not None:
                 want = _safe_normalize_question_type(outline.type)
                 got = _safe_normalize_question_type(q.question_type)
@@ -1805,6 +1861,19 @@ class QuestionGenerationService:
             job_description=request.job_description,
         )
         return questions, flagged, distribution_match
+
+
+def _llm_changed_topic(q: GeneratedQuestionItem, outline: Any) -> bool:
+    """True khi LLM ghi skill/focus khác slot (chỉ dùng lúc regen có lưu ý HR)."""
+    if q.topic_overridden:
+        return True
+    llm_skill = (q.skill or "").strip().lower()
+    llm_focus = (q.focus_area or "").strip().lower()
+    slot_skill = (getattr(outline, "skill", None) or "").strip().lower()
+    slot_focus = (getattr(outline, "focus_area", None) or "").strip().lower()
+    if llm_skill and llm_skill != slot_skill:
+        return True
+    return bool(llm_focus) and llm_focus != slot_focus
 
 
 def _safe_normalize_question_type(value: str | None) -> str:
