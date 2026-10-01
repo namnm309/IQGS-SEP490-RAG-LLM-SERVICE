@@ -19,6 +19,7 @@ from openai import OpenAI
 
 from config.settings import Settings
 from helpers.jd_validator import validate_it_domain
+from helpers.tech_skill_catalog import backfill_skills
 from models.internal_schemas import ParseCvResponse
 from services.document_classify import (
     check_pass_rules,
@@ -141,6 +142,8 @@ class CvParseService:
             ), 422
 
         # Chuẩn bị caller gọi LLM tùy theo loại file
+        # SCRUM-504: giữ lại text CV để bù skill LLM bỏ sót (ảnh thì không có text).
+        cv_text: str | None = None
         try:
             if ext in IMAGE_EXTENSIONS:
                 image_b64 = base64.b64encode(file_bytes).decode("ascii")
@@ -149,6 +152,7 @@ class CvParseService:
                 )
             else:
                 text = self._extract_document_text(file_bytes, file_name)
+                cv_text = text
                 # SCRUM-466 L1: keyword IT trước khi tốn token LLM
                 l1_err = validate_it_domain(text)
                 if l1_err:
@@ -226,6 +230,21 @@ class CvParseService:
             ), 422
 
         skills = self._normalize_skills(parsed.get("skills"))
+
+        # SCRUM-504: LLM hay bỏ sót công nghệ nằm rải rác trong phần project/experience
+        # (vd. CV có cả C# và Java nhưng chỉ trả C#) → quét text theo catalog rồi union.
+        # Chỉ bù khi LLM đã nhận ra ít nhất 1 kỹ năng: nếu LLM không thấy kỹ năng nào thì
+        # vẫn giữ nguyên luật reject của SCRUM-466 (tránh "cứu" cả tài liệu không phải CV).
+        if cv_text and skills:
+            skills, added = backfill_skills(skills, cv_text)
+            skills = self._normalize_skills(skills)
+            if added:
+                logger.info(
+                    "parse-cv: bù %d kỹ năng từ text CV (%s)",
+                    len(added),
+                    ", ".join(added),
+                )
+
         if not skills:
             return None, build_rag_error_detail(
                 error="CV không có kỹ năng IT",

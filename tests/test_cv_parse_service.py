@@ -89,7 +89,8 @@ def test_parse_cv_docx_text_success() -> None:
     assert status == 200
     assert result is not None
     assert result.success is True
-    assert result.skills == ["C#", "ASP.NET Core", "PostgreSQL"]
+    # SCRUM-504: skill LLM giữ nguyên thứ tự ở đầu; phía sau có thể được bù từ text CV.
+    assert result.skills[:3] == ["C#", "ASP.NET Core", "PostgreSQL"]
     assert result.summary == "Backend dev 3 năm."
     assert result.file_name == "cv.docx"
     assert result.document_type == "resume"
@@ -103,7 +104,8 @@ def test_parse_cv_dedup_and_strip_skills() -> None:
     result, _, _ = service.parse_upload(docx, "cv.docx")
 
     assert result is not None
-    assert result.skills == ["C#", "Docker"]
+    # Dedupe/strip áp cho phần skill LLM; SCRUM-504 có thể bù thêm skill từ text CV.
+    assert result.skills[:2] == ["C#", "Docker"]
     assert result.summary is None
 
 
@@ -115,7 +117,7 @@ def test_parse_cv_markdown_fenced_json() -> None:
     result, error, status = service.parse_upload(docx, "cv.docx")
 
     assert error is None and status == 200
-    assert result is not None and result.skills == ["Python"]
+    assert result is not None and result.skills[0] == "Python"
 
 
 def test_parse_cv_json_retry_then_success() -> None:
@@ -143,7 +145,7 @@ def test_parse_cv_json_retry_then_success() -> None:
     )
 
     assert error is None and status == 200
-    assert result is not None and result.skills == ["Go"]
+    assert result is not None and result.skills[0] == "Go"
     assert len(calls) == 2
 
 
