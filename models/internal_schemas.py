@@ -827,6 +827,8 @@ class EvaluateAnswerRequest(BaseModel):
     question_type: str | None = Field(default=None, alias="questionType")
     # SCRUM-447: marketplace (default) | coach
     scoring_mode: str | None = Field(default=None, alias="scoringMode")
+    # Vietnamese | English — ngôn ngữ feedback. Trống = tiếng Việt (hành vi cũ).
+    language: str | None = None
 
     model_config = ConfigDict(populate_by_name=True)
 

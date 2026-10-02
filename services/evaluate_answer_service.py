@@ -10,6 +10,7 @@ from openai import OpenAI
 
 from config.settings import Settings
 from models.internal_schemas import EvaluateAnswerRequest, EvaluateAnswerResponse
+from helpers.language_prompt import language_instruction_block
 from services.json_output_parser import build_json_fix_prompt, extract_json_object, is_retryable_json_error
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ EVALUATE_ANSWER_SYSTEM_PROMPT = """Bạn là giám khảo phỏng vấn AI, ch�
 ## Quy tắc bắt buộc
 1. Chấm dựa trên câu hỏi, tiêu chí đánh giá (evaluationCriteria), và câu trả lời ứng viên.
 2. sampleAnswer (nếu có) chỉ dùng nội bộ để đối chiếu — KHÔNG nhắc đến sample answer trong strengths/improvements/suggestion.
-3. Trả lời bằng TIẾNG VIỆT.
+3. Viết mọi trường chữ tự do theo OUTPUT_LANGUAGE ở cuối prompt.
 4. Chỉ trả về JSON hợp lệ, không markdown fence, không text ngoài JSON.
 5. score là số thực từ 0 đến 100 (có thể có phần thập phân).
 6. strengths: 1–4 điểm mạnh cụ thể của câu trả lời.
@@ -42,7 +43,7 @@ EVALUATE_ANSWER_SYSTEM_PROMPT = """Bạn là giám khảo phỏng vấn AI, ch�
 EVALUATE_COACH_SYSTEM_PROMPT = """Bạn là giám khảo Coach competency. Chỉ chấm 3 chiều — KHÔNG kết luận Fresher/Junior/Middle/Senior.
 
 ## Quy tắc bắt buộc
-1. Trả lời bằng TIẾNG VIỆT, chỉ JSON hợp lệ.
+1. Chỉ JSON hợp lệ. Viết strengths, improvements và suggestion theo OUTPUT_LANGUAGE ở cuối prompt.
 2. BẮT BUỘC dimensionScores với đúng 3 key: correctness, relevance, clarity (mỗi chiều 0–100).
 3. score (optional): có thể để null — Backend sẽ tính overall. Nếu có score thì chỉ là gợi ý hiển thị, không thay công thức Backend.
 4. strengths / improvements / suggestion như bình thường.
@@ -86,6 +87,7 @@ class EvaluateAnswerService:
 
             is_coach = (request.scoring_mode or "").strip().lower() == "coach"
             system_prompt = EVALUATE_COACH_SYSTEM_PROMPT if is_coach else EVALUATE_ANSWER_SYSTEM_PROMPT
+            system_prompt = system_prompt + "\n\n" + language_instruction_block(request.language)
 
             payload = self._build_user_payload(request)
             raw = self._call_llm(payload, system_prompt=system_prompt)
