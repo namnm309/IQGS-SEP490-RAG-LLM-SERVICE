@@ -432,3 +432,88 @@ def test_reload_config_with_api_key(client: TestClient, settings: Settings) -> N
     assert body["success"] is True
     assert body["chatModel"] == settings.chat_model
 
+
+
+# ---- Sinh đề Candidate/Coach chạy nền (tránh Cloudflare cắt request > ~100s) ----
+
+_CANDIDATE_ASYNC_BODY = {
+    "jobId": "aaaaaaaa-0000-0000-0000-000000000001",
+    "ownerId": "11111111-1111-1111-1111-111111111111",
+    "jobDescription": "Backend role",
+    "audience": "coach",
+    "cvContext": "Skills: C#, ASP.NET",
+    "approvedPlan": {
+        "roleTitle": "CV check",
+        "experienceLevel": "junior",
+        "totalQuestions": 1,
+        "questionTypeDistribution": [{"type": "technical", "count": 1, "reason": "CV"}],
+    },
+}
+
+
+def test_candidate_generate_questions_async_returns_202_then_completed(
+    client: TestClient, settings: Settings
+) -> None:
+    import api.deps as deps
+
+    deps._candidate_question_service.generate_from_plan.return_value = MagicMock(
+        success=True,
+        questions=[object()],
+        model_dump=lambda **_kw: {"success": True, "questions": [{"order": 1}], "kbSource": "inferred"},
+    )
+    headers = {"X-Internal-Api-Key": settings.internal_api_key}
+
+    accepted = client.post(
+        "/internal/rag/candidate/generate-questions-from-plan/async",
+        headers=headers,
+        json=_CANDIDATE_ASYNC_BODY,
+    )
+    assert accepted.status_code == 202
+    assert accepted.json()["jobId"] == _CANDIDATE_ASYNC_BODY["jobId"]
+
+    # TestClient chạy background task xong trước khi trả về nên poll lần đầu đã có kết quả.
+    status = client.get(
+        f"/internal/rag/candidate/generate-questions-from-plan/jobs/{_CANDIDATE_ASYNC_BODY['jobId']}",
+        headers=headers,
+    )
+    assert status.status_code == 200
+    body = status.json()
+    assert body["status"] == "COMPLETED"
+    assert body["result"]["success"] is True
+    assert body["result"]["kbSource"] == "inferred"
+
+
+def test_candidate_generate_questions_async_marks_failed_when_no_questions(
+    client: TestClient, settings: Settings
+) -> None:
+    headers = {"X-Internal-Api-Key": settings.internal_api_key}
+    body = {**_CANDIDATE_ASYNC_BODY, "jobId": "aaaaaaaa-0000-0000-0000-000000000002"}
+    # Mock mặc định trả success=True nhưng questions=[] → job phải FAILED chứ không được báo thành công.
+    assert client.post(
+        "/internal/rag/candidate/generate-questions-from-plan/async", headers=headers, json=body
+    ).status_code == 202
+
+    status = client.get(
+        "/internal/rag/candidate/generate-questions-from-plan/jobs/aaaaaaaa-0000-0000-0000-000000000002",
+        headers=headers,
+    )
+    assert status.json()["status"] == "FAILED"
+    assert status.json()["result"]["error"]
+
+
+def test_candidate_generate_questions_job_unknown_returns_404(
+    client: TestClient, settings: Settings
+) -> None:
+    response = client.get(
+        "/internal/rag/candidate/generate-questions-from-plan/jobs/does-not-exist",
+        headers={"X-Internal-Api-Key": settings.internal_api_key},
+    )
+    assert response.status_code == 404
+
+
+def test_candidate_generate_questions_async_requires_api_key(client: TestClient) -> None:
+    response = client.post(
+        "/internal/rag/candidate/generate-questions-from-plan/async",
+        json=_CANDIDATE_ASYNC_BODY,
+    )
+    assert response.status_code in (401, 403)

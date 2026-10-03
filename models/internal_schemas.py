@@ -553,6 +553,14 @@ class CandidateGenerateQuestionsFromPlanRequest(GenerateQuestionsFromPlanRequest
     candidate_note: str | None = Field(default=None, alias="candidateNote", max_length=2000)
 
 
+class CandidateGenerateQuestionsFromPlanAsyncRequest(CandidateGenerateQuestionsFromPlanRequest):
+    """Sinh đề Candidate/Coach chạy nền: BE gửi kèm jobId rồi poll kết quả."""
+
+    job_id: str = Field(..., alias="jobId")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class GenerateQuestionsFromPlanAsyncRequest(GenerateQuestionsFromPlanRequest):
     job_id: str = Field(..., alias="jobId")
 

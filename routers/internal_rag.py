@@ -1,4 +1,6 @@
 """Internal RAG endpoints — chỉ Backend gọi qua X-Internal-Api-Key."""
+import logging
+
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile
 
 from api.deps import (
@@ -43,6 +45,7 @@ from models.internal_schemas import (
     GenerateQuestionsFromPlanResponse,
     CandidateGeneratePlanRequest,
     CandidateGenerateQuestionsFromPlanRequest,
+    CandidateGenerateQuestionsFromPlanAsyncRequest,
     GenerateQuestionsRequest,
     GenerateQuestionsResponse,
     IngestRequest,
@@ -76,6 +79,11 @@ from models.internal_schemas import (
 )
 from security.internal_api_key import verify_internal_api_key
 from services.async_generation_service import AsyncGenerationService
+from services.candidate_async_job_store import (
+    STATUS_COMPLETED,
+    STATUS_PROCESSING,
+    candidate_async_job_store,
+)
 from services.async_ingest_service import AsyncIngestService
 from services.cv_parse_service import CvParseService
 from services.evaluate_answer_service import EvaluateAnswerService
@@ -94,6 +102,8 @@ from services.recommend_interview_configuration_service import RecommendIntervie
 from services.roadmap_recommendation_service import RoadmapRecommendationService
 from services.adaptive_competency_service import AdaptiveCompetencyService
 from services.rag_error_helpers import build_rag_error_detail
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/internal/rag",
@@ -418,6 +428,62 @@ def candidate_generate_questions_from_plan(
     service: CandidateQuestionGenerationService = Depends(get_candidate_question_service),
 ) -> GenerateQuestionsFromPlanResponse:
     return service.generate_from_plan(request)
+
+
+def _run_candidate_questions_job(
+    job_id: str,
+    request: GenerateQuestionsFromPlanRequest,
+    service: CandidateQuestionGenerationService,
+) -> None:
+    """Chạy nền: sinh đề rồi ghi kết quả vào kho job để BE poll."""
+    try:
+        result = service.generate_from_plan(request)
+        ok = bool(result.success and result.questions)
+        payload = result.model_dump(by_alias=True, exclude_none=True, mode="json")
+        if not ok and not payload.get("error"):
+            payload["error"] = "RAG candidate generate-questions-from-plan thất bại."
+        candidate_async_job_store.finish(job_id, success=ok, result=payload)
+    except Exception as exc:  # noqa: BLE001 — mọi lỗi đều phải ghi lại, không để job treo PROCESSING
+        logger.exception("Candidate async question generation failed for job %s", job_id)
+        candidate_async_job_store.finish(
+            job_id,
+            success=False,
+            result={"success": False, "questions": [], "error": f"Lỗi sinh câu hỏi: {exc}"},
+        )
+
+
+@router.post(
+    "/candidate/generate-questions-from-plan/async",
+    response_model=AsyncAcceptedResponse,
+    status_code=202,
+    response_model_exclude_none=True,
+)
+def candidate_generate_questions_from_plan_async(
+    request: CandidateGenerateQuestionsFromPlanAsyncRequest,
+    background_tasks: BackgroundTasks,
+    service: CandidateQuestionGenerationService = Depends(get_candidate_question_service),
+) -> AsyncAcceptedResponse:
+    # Trả 202 ngay để request không bị Cloudflare (~100s) cắt; BE sẽ poll GET .../jobs/{job_id}.
+    questions_request = CandidateGenerateQuestionsFromPlanRequest.model_validate(
+        request.model_dump(by_alias=True, exclude={"jobId", "job_id"})
+    )
+    candidate_async_job_store.start(request.job_id)
+    background_tasks.add_task(
+        _run_candidate_questions_job, request.job_id, questions_request, service
+    )
+    return AsyncAcceptedResponse(accepted=True, job_id=request.job_id, phase="QUESTIONS")
+
+
+@router.get("/candidate/generate-questions-from-plan/jobs/{job_id}")
+def candidate_generate_questions_job_status(job_id: str) -> dict:
+    job = candidate_async_job_store.get(job_id)
+    if job is None:
+        # Job hết hạn hoặc RAG đã restart → BE coi là lỗi và cho user thử lại.
+        raise HTTPException(status_code=404, detail="Không tìm thấy job sinh đề (hết hạn hoặc RAG đã khởi động lại).")
+    status = job["status"]
+    if status == STATUS_PROCESSING:
+        return {"status": STATUS_PROCESSING}
+    return {"status": status, "result": job["result"]}
 
 
 @router.post(
