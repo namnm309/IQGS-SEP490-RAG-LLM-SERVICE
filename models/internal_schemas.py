@@ -815,6 +815,18 @@ class QuestionAssistResponse(BaseModel):
 # ── Evaluate Answer (SCRUM-281) — chấm câu trả lời Candidate ─────────────────
 
 
+class RubricCriterionInput(BaseModel):
+    """1 tiêu chí rubric HR — BE gán code C1, C2... để RAG trả điểm đúng tiêu chí."""
+
+    code: str
+    label: str
+    weight: int = 0
+    # Mốc điểm HR mô tả, ví dụ {"25": "...", "50": "...", "100": "..."}
+    anchors: dict[str, str] = Field(default_factory=dict)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class EvaluateAnswerRequest(BaseModel):
     """Input BE gửi khi Candidate submit answer trong practice session."""
 
@@ -829,6 +841,8 @@ class EvaluateAnswerRequest(BaseModel):
     scoring_mode: str | None = Field(default=None, alias="scoringMode")
     # Vietnamese | English — ngôn ngữ feedback. Trống = tiếng Việt (hành vi cũ).
     language: str | None = None
+    # Có rubric hợp lệ (practice/hiring) → AI chấm từng tiêu chí; trống = chấm tổng thể như cũ.
+    rubric_criteria: list[RubricCriterionInput] = Field(default_factory=list, alias="rubricCriteria")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -842,6 +856,8 @@ class EvaluateAnswerResponse(BaseModel):
     improvements: list[str] = Field(default_factory=list)
     suggestion: str | None = None
     dimension_scores: dict[str, float] | None = Field(default=None, alias="dimensionScores")
+    # Điểm từng tiêu chí rubric theo code (C1, C2...) — chỉ có khi chấm theo rubric.
+    criterion_scores: dict[str, float] | None = Field(default=None, alias="criterionScores")
     processing_time_ms: float | None = Field(default=None, alias="processingTimeMs")
     error: str | None = None
     detail: str | None = None
